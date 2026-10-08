@@ -38,6 +38,22 @@ export function readText(p: string): string {
 export function parseCorpus(text: string, p: string): Corpus {
   const lines = text.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return parseCorpusLines(lines, p);
+}
+
+/// Lines of a file too large for one JS string (V8 caps strings near 512 MB).
+function bufferLines(b: Buffer): string[] {
+  const out: string[] = [];
+  for (let pos = 0; pos < b.length; ) {
+    let e = b.indexOf(10, pos);
+    if (e < 0) e = b.length;
+    out.push(b.toString("utf8", pos, e));
+    pos = e + 1;
+  }
+  return out;
+}
+
+function parseCorpusLines(lines: string[], p: string): Corpus {
   if (lines.length === 0) throw new Error(`${p}: empty file`);
   const hdr = lines[0].replace(/\r$/, "");
   const c: Corpus = { book: parseHeader(hdr), engine: get(hdr, "engine") === "true", cmds: [] };
@@ -58,8 +74,14 @@ export function parseCorpus(text: string, p: string): Corpus {
 }
 
 export function loadCorpus(p: string): Corpus {
+  let b: Buffer;
   try {
-    return parseCorpus(readText(p), p);
+    b = fs.readFileSync(p);
+  } catch {
+    return die(`${p}: cannot read`);
+  }
+  try {
+    return parseCorpusLines(bufferLines(b), p);
   } catch (e) {
     return die((e as Error).message);
   }
