@@ -70,9 +70,12 @@ export function readCmd(v: DataView, o: number): Command {
   }
 }
 
-/// Copy one whole slot (router: ingress → inbox).
-export function copySlot(from: DataView, fo: number, to: DataView, too: number, size: number): void {
-  new Uint8Array(to.buffer, too, size).set(new Uint8Array(from.buffer, fo, size));
+/// Copy one command slot (router: ingress → inbox), field by field: no allocation.
+export function copyCmd(from: DataView, fo: number, to: DataView, too: number): void {
+  for (let i = 0; i < 48; i += 8) to.setFloat64(too + i, from.getFloat64(fo + i, true), true);
+  to.setUint32(too + 48, from.getUint32(fo + 48, true), true);
+  to.setUint32(too + 52, from.getUint32(fo + 52, true), true);
+  to.setUint8(too + 56, from.getUint8(fo + 56));
 }
 
 // ---- EvtMsg: outbox slot (72 bytes) ----------------------------------------------------------
@@ -80,13 +83,52 @@ export function copySlot(from: DataView, fo: number, to: DataView, too: number, 
 // 64 symbol (u32) · 68 ctl · 69 ev (0 accepted … 4 replaced) · 70 reason
 export const EVT_SLOT = 72;
 
-/// An event as egress plugs see it (decoded from the outbox slot).
+/// An event as egress plugs see it. Plugs receive one reused view per
+/// partition (the ring slot, decoded on demand), as Rust plugs borrow the
+/// slot: copy what you keep (`copyEvtMsg`).
 export interface EvtMsg {
-  iseq: number;
-  seq: number;
-  tPub: number;
-  symbol: number;
-  ev: Event;
+  readonly iseq: number;
+  readonly seq: number;
+  readonly tPub: number;
+  readonly symbol: number;
+  /// The event's kind, without decoding the rest.
+  readonly kind: Event["kind"];
+  /// The decoded event (built on first access per slot).
+  readonly ev: Event;
+}
+
+const KINDS: Array<Event["kind"]> = ["accepted", "rejected", "trade", "closed", "replaced"];
+
+/// A reusable EvtMsg over the outbox slot at `off`.
+export class EvtView implements EvtMsg {
+  iseq = 0;
+  seq = 0;
+  tPub = 0;
+  symbol = 0;
+  private off = 0;
+  private decoded: Event | undefined;
+  constructor(private readonly v: DataView) {}
+  at(off: number): this {
+    const v = this.v;
+    this.off = off;
+    this.iseq = v.getFloat64(off, true);
+    this.seq = v.getFloat64(off + 8, true);
+    this.tPub = v.getFloat64(off + 16, true);
+    this.symbol = v.getUint32(off + 64, true);
+    this.decoded = undefined;
+    return this;
+  }
+  get kind(): Event["kind"] {
+    return KINDS[this.v.getUint8(this.off + 69)];
+  }
+  get ev(): Event {
+    return (this.decoded ??= readEvent(this.v, this.off));
+  }
+}
+
+/// A detached copy of an EvtMsg (for plugs that hold events).
+export function copyEvtMsg(m: EvtMsg): EvtMsg {
+  return { iseq: m.iseq, seq: m.seq, tPub: m.tPub, symbol: m.symbol, kind: m.kind, ev: m.ev };
 }
 
 export function writeEvt(v: DataView, o: number, iseq: number, seq: number, tPub: number, sym: number, e: Event): void {
@@ -132,6 +174,4 @@ export function readEvent(v: DataView, o: number): Event {
   }
 }
 
-export function readEvtMsg(v: DataView, o: number): EvtMsg {
-  return { iseq: v.getFloat64(o, true), seq: v.getFloat64(o + 8, true), tPub: v.getFloat64(o + 16, true), symbol: v.getUint32(o + 64, true), ev: readEvent(v, o) };
-}
+

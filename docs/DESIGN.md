@@ -49,7 +49,11 @@ numbers are float64, exact to 2^53, which is matcher-ts's own range.
 
 ## The owner thread
 
-Egress plugs are user objects, so they run on the owner thread. It pumps
+Egress plugs are user objects, so they run on the owner thread. Each
+partition hands its plugs one reused `EvtMsg` view over the outbox slot:
+scalar fields are read eagerly, `kind` without decoding, and `ev` is built
+on first access. Plugs that keep events copy them (`copyEvtMsg`), as Rust
+plugs copy out of a borrowed slot. It pumps
 every outbox whenever it is about to wait: in `publish` when ingress is
 full, in `drain`, `snapshot` and `shutdown`, and on an unref'd 1 ms timer
 when the event loop is idle (so `acks` keep flowing). Decoding events into

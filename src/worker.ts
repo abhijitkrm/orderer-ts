@@ -14,7 +14,7 @@ import { BookConfig } from "./matcher/book";
 import { Command, Event } from "./matcher/types";
 import { Block, MatchingCore, parseSnapshot, resolveCore } from "./core";
 import { ChunkShared, ChunkWriter, JournalFormat, ioLoop, mergeJournals, readCmdDir } from "./journal";
-import { CMD_SLOT, Control, cmdArg, cmdCtl, cmdIseq, cmdSym, cmdTPub, copySlot, readCmd, setCmdIseq, writeEvt, writeEvtCtl } from "./msg";
+import { Control, cmdArg, cmdCtl, cmdIseq, cmdSym, cmdTPub, copyCmd, readCmd, setCmdIseq, writeEvt, writeEvtCtl } from "./msg";
 import { PartitionMap } from "./routing";
 import { Consumer, RingShared, SingleProducer, WaitStrategy } from "./ring";
 
@@ -98,14 +98,14 @@ function router(d: RouterData): void {
       const ib = inboxes[map.partition(cmdSym(v, o))];
       const s = ib.stage();
       if (s >= 0) {
-        copySlot(v, o, ib.view, s, CMD_SLOT);
+        copyCmd(v, o, ib.view, s);
         setCmdIseq(ib.view, s, iseq);
       }
     } else {
       for (const ib of inboxes) {
         const s = ib.stage();
         if (s >= 0) {
-          copySlot(v, o, ib.view, s, CMD_SLOT);
+          copyCmd(v, o, ib.view, s);
           setCmdIseq(ib.view, s, iseq);
         }
       }

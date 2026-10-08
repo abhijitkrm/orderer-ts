@@ -4,7 +4,7 @@
 //! unref'd timer otherwise.
 
 import { eventCanonical } from "./matcher/types";
-import { EvtMsg } from "./msg";
+import { EvtMsg, copyEvtMsg } from "./msg";
 
 /// What a partition's egress instances know.
 export interface EgressCtx {
@@ -57,7 +57,7 @@ export function collect(tagged: boolean): [EgressFactory, CollectHandle] {
 
 // ---- Callback ----------------------------------------------------------------------------------
 
-/// f(partition, msg) for every event.
+/// f(partition, msg) for every event (msg is reused: copyEvtMsg to keep it).
 export function callback(f: (partition: number, m: EvtMsg) => void): EgressFactory {
   return (ctx) => ({ onEvent: (m) => f(ctx.partition, m) });
 }
@@ -78,7 +78,7 @@ export function acks(f: (partition: number, m: EvtMsg) => void): EgressFactory {
         head = 0;
       }
     };
-    return { onEvent: (m) => void pending.push(m), onBatchEnd: release, onIdle: release, onShutdown: release };
+    return { onEvent: (m) => void pending.push(copyEvtMsg(m)), onBatchEnd: release, onIdle: release, onShutdown: release };
   };
 }
 
@@ -103,7 +103,7 @@ export function metrics(sampleCapacity: number): [EgressFactory, PartitionMetric
     return {
       onEvent: (e) => {
         m.events++;
-        if (e.ev.kind === "trade") m.trades++;
+        if (e.kind === "trade") m.trades++;
         if (e.iseq !== lastIseq) {
           lastIseq = e.iseq;
           m.commands++;

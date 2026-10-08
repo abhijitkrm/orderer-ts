@@ -18,7 +18,7 @@ import { Command } from "./matcher/types";
 import { Block, snapshotHeader } from "./core";
 import { EgressCtx, Egress, EgressFactory } from "./egress";
 import { ChunkShared, ChunkWriter, JournalConfig, createChunkShared, openJournal } from "./journal";
-import { CMD_SLOT, Control, EVT_SLOT, readEvtMsg, evtArg, evtCtl, evtIseq, writeCmd, writeCtl } from "./msg";
+import { CMD_SLOT, Control, EVT_SLOT, EvtView, evtArg, evtCtl, writeCmd, writeCtl } from "./msg";
 import { PartitionMap } from "./routing";
 import { Consumer, Publish, RingShared, SingleProducer, WaitStrategy, backoff, busySpin, createRing, parkUs } from "./ring";
 import { EngineData, EngineInitial, FAIL_BYTES, IoData, RouterData, readFailure, recordFailure } from "./worker";
@@ -242,10 +242,11 @@ export class Pipeline {
       };
       if (evt !== null) part.evtJournal = new ChunkWriter(evt, o.journal!.format);
       for (const f of o.egress) part.plugs.push(f(ctx));
+      const view = new EvtView(part.outbox.view);
       part.handler = (v, off, _seq, eob) => {
         const ctl = evtCtl(v, off);
         if (ctl === Control.None) {
-          const m = readEvtMsg(v, off);
+          const m = view.at(off);
           part.lastIseq = m.iseq;
           if (part.evtJournal !== undefined) part.evtJournal.pushEvt(m.seq, m.symbol, m.ev);
           for (const pl of part.plugs) pl.onEvent(m);
@@ -257,7 +258,6 @@ export class Pipeline {
           part.epoch = evtArg(v, off);
         } else if (ctl === Control.Shutdown) {
           part.stopSeen = true;
-          void evtIseq;
         }
         if (eob) for (const pl of part.plugs) pl.onBatchEnd?.();
       };
