@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: scripts/test.sh
+
+  # Private sibling repos need a token with read access to them
+  # (secrets.ORDERER_REPO_TOKEN); public ones work with the default token.
+  vendored:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer
+          path: upstream/orderer
+          fetch-depth: 0
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - run: UPSTREAM_DIR=upstream/orderer scripts/vendored.sh
+
+  # Both axes: orderer-ts vs orderer-rust and vs matcher-ts, via the spec repo's scripts.
+  cross-impl:
+    runs-on: ubuntu-latest
+    env:
+      ORDERER_TS_DIR: ${{ github.workspace }}
+      ORDERER_RUST_DIR: ${{ github.workspace }}/upstream/orderer-rust
+      MATCHER_TS_DIR: ${{ github.workspace }}/upstream/matcher-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer
+          path: upstream/orderer
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer-rust
+          path: upstream/orderer-rust
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/matcher-ts
+          ref: 0ef59a2b822b424fb6656b44f0406d19321b0d27
+          path: upstream/matcher-ts
+      - run: cd upstream/matcher-ts && npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - run: upstream/orderer/scripts/diffuzz.sh 4 10000
+      - run: upstream/orderer/scripts/e2e.sh
+      - run: upstream/orderer/scripts/snapdiff.sh

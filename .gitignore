@@ -1,0 +1,7 @@
+node_modules/
+dist/
+harness/
+bench/
+*.run.cmd.jsonl
+*.setup.cmd.jsonl
+.DS_Store
