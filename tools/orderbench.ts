@@ -206,4 +206,4 @@ const base = a.get("--baseline");
 const eff = mode === "pipe" && base !== undefined ? (opsS / (Number(P) * Number(base))).toFixed(2) : "";
 const r = (x: number) => Math.round(x);
 process.stdout.write(`| ${tag} | ${mode} | ${P} | ${prod} | ${row.ops} | ${r(opsS)} | ${eff} | ${r(mean)} | ${r(pct(row.lat, 0.5))} | ${r(pct(row.lat, 0.9))} | ${r(pct(row.lat, 0.99))} | ${r(pct(row.lat, 0.999))} | ${r(row.lat.length === 0 ? 0 : row.lat[row.lat.length - 1])} | ${config.join(" ")} |\n`);
-process.stderr.write(`env: ${cpu()} / orderer-ts 0.1.0 / node ${process.version}\n`);
+process.stderr.write(`env: ${cpu()} / orderer-ts 0.2.0 / node ${process.version}\n`);

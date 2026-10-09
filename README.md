@@ -25,6 +25,15 @@ pumping the outboxes whenever it waits on a full ring, drains, snapshots or
 shuts down, and on an unref'd timer otherwise. The whole API is
 synchronous.
 
+## Install
+
+```bash
+npm install github:abhijitkrm/orderer-ts#v0.2.0
+```
+
+The package (`@abhijitkrm/orderer@0.2.0`) is ready for npm (`npm pack`
+passes) but not yet published.
+
 ## Quick start
 
 ```ts

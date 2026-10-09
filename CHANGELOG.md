@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: orderer-spec/1.2
+## 0.2.0 (orderer-spec/1.2)
 
 - Binary journals are version 2 (CRC-32C per record); version 1 still reads.
 - `repairDir` / `orderrecover --repair` truncate a torn final record.
