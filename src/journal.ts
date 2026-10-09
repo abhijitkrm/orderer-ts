@@ -578,7 +578,7 @@ export interface ChunkShared {
   sab: SharedArrayBuffer;
   path: string; // opened for appending by the I/O worker
   fsync: FsyncPolicy | null; // null: never sync, durable = flushed
-  marks: SharedArrayBuffer; // BigInt64Array [flushed, durable]
+  marks: SharedArrayBuffer; // BigInt64Array [flushed, durable, fsyncs, fsync ns total, fsync ns max]
 }
 
 export function createChunkShared(path: string, fsync: FsyncPolicy | null, marks: SharedArrayBuffer): ChunkShared {
@@ -720,7 +720,14 @@ export function ioLoop(sh: ChunkShared, alert?: SharedArrayBuffer): void {
   const sync = () => {
     if (Atomics.load(ctl, ERR_LEN) === 0) {
       try {
+        const t0 = performance.now();
         fs.fsyncSync(fd);
+        const ns = BigInt(Math.round((performance.now() - t0) * 1e6));
+        if (marks.length >= 5) { // [flushed, durable, fsyncs, fsync ns total, fsync ns max]
+          Atomics.add(marks, 2, 1n);
+          Atomics.add(marks, 3, ns);
+          if (ns > Atomics.load(marks, 4)) Atomics.store(marks, 4, ns);
+        }
         Atomics.store(marks, 1, BigInt(written));
       } catch (e) {
         setErr(`journal fsync: ${(e as Error).message}`);

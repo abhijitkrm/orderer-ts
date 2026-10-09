@@ -7,6 +7,8 @@
 - `Pipeline.checkpoint()` rotates journals onto segments at a clean cut (the
   I/O worker switches files on a ROTATE marker), writes the snapshot durably
   and removes covered segments.
+- `Pipeline.stats()` (stats.ts): ring depths, per-partition counts,
+  watermarks, fsync timings; `toPrometheus(stats)`.
 - `Builder.checkpointEvery(ms)`: automatic checkpoints from the owner's
   event loop while it is idle.
 - `orderrun --checkpoint-every K` and `--durable`; `scripts/test.sh` runs the

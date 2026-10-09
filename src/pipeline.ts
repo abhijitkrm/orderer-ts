@@ -23,8 +23,9 @@ import {
 } from "./journal";
 import { CMD_SLOT, Control, EVT_SLOT, EvtView, evtArg, evtCtl, evtIseq, writeCmd, writeCtl } from "./msg";
 import { PartitionMap } from "./routing";
-import { Consumer, MultiProducer, Publish, RingShared, WaitStrategy, backoff, busySpin, createRing, parkUs } from "./ring";
+import { Consumer, MultiProducer, Publish, RingShared, RingView, WaitStrategy, backoff, busySpin, createRing, parkUs } from "./ring";
 import { EngineData, EngineInitial, FAIL_BYTES, IoData, RouterData, readFailure, recordFailure } from "./worker";
+import { PipelineStats } from "./stats";
 import { HANDLE_CTL_WORDS, Handle, HandleDescriptor, Status, anyInFlight, setClosed, setStamps, takeSlot } from "./handle";
 
 export type ErrorKind = "closed" | "full" | "failed" | "config" | "io";
@@ -166,6 +167,10 @@ export class Pipeline {
   private readonly timer: NodeJS.Timeout;
   private readonly journalCfg?: JournalConfig;
   private readonly ckptMs: number;
+  private readonly counters: Float64Array[] = [];
+  private readonly inboxViews: RingView[] = [];
+  private readonly outboxViews: RingView[] = [];
+  private ingressView!: RingView;
   private lastCkpt = performance.now();
   private readonly pumpFn = () => this.pump();
 
@@ -198,7 +203,7 @@ export class Pipeline {
         fs.mkdirSync(jc.dir, { recursive: true });
         if (!jc.append) clearJournalDir(jc.dir, jc.format);
         for (let p = 0; p < P; p++) {
-          const m = new SharedArrayBuffer(16);
+          const m = new SharedArrayBuffer(40);
           const marks = new BigInt64Array(m);
           marks[0] = marks[1] = startWm;
           this.marks.push(marks);
@@ -233,11 +238,15 @@ export class Pipeline {
       inboxes.push(inbox);
       const ch = new MessageChannel();
       this.ports.push(ch.port1);
+      const counters = new SharedArrayBuffer(16);
+      this.counters.push(new Float64Array(counters));
+      this.inboxViews.push(new RingView(inbox));
+      this.outboxViews.push(new RingView(outbox));
       const ed: EngineData = {
         ...common("engine", "engine"), role: "engine", partition: p, partitions: P, table, inbox, outbox, core: o.core,
         book: o.book, journal: journaled ? { shared: cmdShared[p]!, format: o.journal!.format, dir: o.journal!.dir } : null,
         initial: o.initial === undefined ? null : { snapshot: o.initial.snapshot, journal: o.initial.journal },
-        port: ch.port2, wait: o.waits.engine,
+        port: ch.port2, wait: o.waits.engine, counters,
       };
       spawn(ed, [ch.port2]);
       if (journaled) spawn({ ...common("io", "journal"), role: "io", shared: cmdShared[p]! } as IoData);
@@ -290,6 +299,7 @@ export class Pipeline {
     };
     spawn(rd);
     this.ingressShared = ingress;
+    this.ingressView = new RingView(ingress);
     this.ingress = new MultiProducer(ingress);
     this.owner = new Handle(this.handleDescriptor(), this.pumpFn);
     this.timer = setInterval(() => this.idleTick(), 1);
@@ -301,6 +311,24 @@ export class Pipeline {
   }
   setTimestamps(on: boolean): void {
     setStamps(this.handleCtl, on);
+  }
+
+  /// Operational statistics (see stats.ts).
+  stats(): PipelineStats {
+    const depth = (r: RingView) => Math.max(r.published() - r.consumed(), 0);
+    return {
+      ingressDepth: depth(this.ingressView),
+      partitions: this.counters.map((c, p) => {
+        const m = this.marks[p];
+        const get = (i: number) => (m === undefined ? 0 : Number(Atomics.load(m, i)));
+        return {
+          partition: p, inboxDepth: depth(this.inboxViews[p]), outboxDepth: depth(this.outboxViews[p]),
+          commands: c[0], events: c[1],
+          flushedIseq: m === undefined ? Infinity : get(0), durableIseq: m === undefined ? Infinity : get(1),
+          fsyncs: get(2), fsyncNsTotal: get(3), fsyncNsMax: get(4),
+        };
+      }),
+    };
   }
 
   /// A publishing handle for another thread: pass the descriptor through

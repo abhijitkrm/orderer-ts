@@ -78,6 +78,7 @@ export interface EngineData extends Common {
   initial: EngineInitial | null;
   port: MessagePort; // snapshot replies
   wait: WaitStrategy;
+  counters: SharedArrayBuffer; // Float64Array [commands, events], published once per batch
 }
 
 export interface IoData extends Common {
@@ -150,8 +151,10 @@ function engine(d: EngineData): void {
   const out = new SingleProducer(d.outbox);
   const core = buildCore(d);
   const journal = d.journal === null ? null : new ChunkWriter(d.journal.shared, d.journal.format);
-  let iseq = 0, tPub = 0, stop = false, force = false;
+  let iseq = 0, tPub = 0, stop = false, force = false, nCommands = 0, nEvents = 0;
+  const counters = new Float64Array(d.counters);
   const emit = (sym: number, seq: number, ev: Event) => {
+    nEvents++;
     const s = out.stage();
     if (s < 0) throw new Error("outbox alerted");
     writeEvt(out.view, s, iseq, seq, tPub, sym, ev);
@@ -164,6 +167,7 @@ function engine(d: EngineData): void {
       const sym = cmdSym(v, o);
       const cmd: Command = readCmd(v, o);
       if (journal !== null) journal.pushCmd(iseq, sym, cmd); // journal-before-apply
+      nCommands++;
       core.apply(sym, cmd, emit);
     } else {
       const cut = cmdIseq(v, o), arg = cmdArg(v, o);
@@ -193,6 +197,10 @@ function engine(d: EngineData): void {
   for (;;) {
     force = false;
     const n = inbox.poll(h);
+    if (n > 0) {
+      counters[0] = nCommands; // a single aligned float64 store: readers see old or new
+      counters[1] = nEvents;
+    }
     if (stop || inbox.isAlerted()) break;
     if (journal !== null && journal.pending() > 0 && (force || (n === 0 && performance.now() - lastHandoff >= 0.05))) {
       journal.handOff();

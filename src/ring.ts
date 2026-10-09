@@ -297,6 +297,9 @@ export class MultiProducer extends Base {
 
 export type Handler = (view: DataView, off: number, seq: number, endOfBatch: boolean) => void;
 
+/// A read-only view of a ring, for statistics (depth = published - consumed).
+export class RingView extends Base {}
+
 /// One consumer: a barrier (cursor + upstream consumers) plus its own watermark.
 export class Consumer extends Base {
   private nextSeq: number;

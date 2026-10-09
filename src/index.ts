@@ -9,3 +9,4 @@ export * from "./pipeline";
 export * from "./recover";
 export * as matcher from "./matcher/index";
 export * from "./handle";
+export * from "./stats";

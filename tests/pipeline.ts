@@ -15,6 +15,7 @@ import {
 import { readSnapshot } from "../src/recover";
 import { Pipeline, PipelineError, Snapshot, Status } from "../src/pipeline";
 import { recover } from "../src/recover";
+import { toPrometheus } from "../src/stats";
 import { CORES } from "../src/core";
 import { PartitionMap, hashPartition } from "../src/routing";
 import { bySymbol, check, finish, concat, dense, eq, fuzzCfg, fuzzCorpus, lines, referenceLines, referenceSnapshot, runAll, runPipeline, scratch, sleepMs } from "./t";
@@ -488,6 +489,27 @@ async function automaticCheckpointsKeepTheDirectoryRecoverable(): Promise<void> 
   check(threw, "needs journals");
 }
 
+function statsCountCommandsEventsAndFsyncs(): void {
+  const cmds = fuzzCorpus(16, 5000, 6);
+  const p = Pipeline.builder().bookConfig(CFG).partitions(3).journal(jcfg(scratch("stats"), "binary")).build();
+  p.publishBatch(cmds);
+  p.drain();
+  const deadline = performance.now() + 10_000;
+  while (p.stats().partitions.some((s) => s.durableIseq < s.flushedIseq) && performance.now() < deadline) {
+    p.pump();
+    sleepMs(5);
+  }
+  const st = p.stats();
+  check(st.ingressDepth === 0 && st.partitions.length === 3);
+  check(st.partitions.every((s) => s.inboxDepth === 0 && s.outboxDepth === 0 && s.fsyncs > 0 && s.fsyncNsMax > 0), JSON.stringify(st));
+  check(st.partitions.reduce((a, s) => a + s.commands, 0) === cmds.length, "commands");
+  check(st.partitions.reduce((a, s) => a + s.events, 0) === referenceLines(CFG, cmds).length, "events");
+  check(Math.max(...st.partitions.map((s) => s.durableIseq)) === cmds.length, "durable");
+  const prom = toPrometheus(st);
+  check(prom.includes("# TYPE orderer_commands_total counter") && prom.includes('orderer_inbox_depth{partition="2"} 0'), prom);
+  p.shutdown();
+}
+
 const tests: Array<[string, () => void]> = [
   ["every_partition_count_matches_reference_per_symbol", everyPartitionCountMatchesReference],
   ["fuzz_runs_are_deterministic_per_partition", fuzzRunsAreDeterministic],
@@ -505,6 +527,7 @@ const tests: Array<[string, () => void]> = [
   ["noop_core_sees_every_command", noopCoreSeesEveryCommand],
   ["failing_core_fails_the_pipeline_instead_of_hanging", failingCoreFailsThePipelineInsteadOfHanging],
   ["failing_egress_fails_the_pipeline", failingEgressFailsThePipeline],
+  ["stats_count_commands_events_and_fsyncs", statsCountCommandsEventsAndFsyncs],
   ["worker_streams_preserve_per_symbol_order", workerStreamsPreservePerSymbolOrder],
   ["every_ok_publish_racing_shutdown_is_applied", everyOkPublishRacingShutdownIsApplied],
   ["crc32c_matches_the_spec_check_value", crc32cMatchesTheSpecCheckValue],
