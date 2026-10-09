@@ -4,12 +4,13 @@
 //! orderer-ts tuning flags (listed in the config column when set):
 //!   --core fifo|noop  --waits relaxed|low  --batch N  --ingress N --inbox N --outbox N
 //!   --events on|off   --baseline OPS (core untimed ops/s, for eff)  --warmups N (JIT, default 3)
-//! One producer: the thread that owns a Pipeline is its only publisher, so
-//! --producers must be 1.
+//! --producers N > 1 publishes from N worker threads (symbol % N streams)
+//! through Handles while the owner pumps egress.
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { execSync } from "child_process";
+import { Worker } from "worker_threads";
 import { Engine } from "../src/matcher/engine";
 import { OrderBook } from "../src/matcher/book";
 import { NullSink } from "../src/matcher/sink";
@@ -75,6 +76,7 @@ function coreMode(setup: Corpus, run: Corpus, warmups: number): Row {
 }
 
 interface PipeOpts {
+  producers: number;
   partitions: number;
   batch: number;
   journal?: JournalConfig;
@@ -104,8 +106,23 @@ function pipeMode(setup: Corpus, run: Corpus, o: PipeOpts, warmups: number): Row
   p.drain();
   gc();
   p.setTimestamps(true);
-  const wall = performance.now();
-  for (let i = 0; i < run.cmds.length; i += o.batch) p.publishBatch(run.cmds, i, Math.min(i + o.batch, run.cmds.length));
+  let wall: number;
+  if (o.producers <= 1) {
+    wall = performance.now();
+    for (let i = 0; i < run.cmds.length; i += o.batch) p.publishBatch(run.cmds, i, Math.min(i + o.batch, run.cmds.length));
+  } else {
+    const ctl = new Int32Array(new SharedArrayBuffer(12)); // ready, start, done
+    const streams: Array<Array<(typeof run.cmds)[0]>> = Array.from({ length: o.producers }, () => []);
+    for (const c of run.cmds) streams[c[0] % o.producers].push(c);
+    for (const st of streams) {
+      new Worker(path.join(__dirname, "producer.js"), { workerData: { desc: p.handleDescriptor(), cmds: st, batch: o.batch, ctl: ctl.buffer } }).unref();
+    }
+    p.pumpWhile(() => Atomics.load(ctl, 0) < o.producers); // workers started, not timed
+    wall = performance.now();
+    Atomics.store(ctl, 1, 1);
+    Atomics.notify(ctl, 1);
+    p.pumpWhile(() => Atomics.load(ctl, 2) < o.producers);
+  }
   p.drain();
   const wallNs = (performance.now() - wall) * 1e6;
   p.setTimestamps(false);
@@ -130,7 +147,7 @@ function cpu(): string {
   return os.cpus()[0]?.model ?? "unknown cpu";
 }
 
-const usage = "orderbench <prefix> --mode core|pipe [--partitions P] [--producers 1] [--journal binary|jsonl|off] " +
+const usage = "orderbench <prefix> --mode core|pipe [--partitions P] [--producers N] [--journal binary|jsonl|off] " +
   "[--journal-dir DIR] [--fsync N] [--tag NAME] [--core fifo|noop] [--waits relaxed|low] [--batch N] " +
   "[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--warmups N]";
 const a = new Args(process.argv.slice(2), usage, ["--mode", "--partitions", "--producers", "--journal", "--journal-dir",
@@ -148,8 +165,8 @@ let P = "-", prod = "-";
 if (mode === "core") {
   row = coreMode(setup, run, warmups);
 } else if (mode === "pipe") {
-  if (a.num("--producers", 1, 1024) !== 1) die("--producers: orderer-ts has one publishing thread (the pipeline's owner)");
   const o: PipeOpts = {
+    producers: Math.max(a.num("--producers", 1, 63), 1),
     partitions: a.num("--partitions", 1, 1024), batch: Math.max(a.num("--batch", 64, 1 << 20), 1),
     waits: lowLatencyWaits(), core: a.get("--core") ?? "fifo",
     rings: [a.num("--ingress", 1 << 14, 1 << 30), a.num("--inbox", 1 << 12, 1 << 30), a.num("--outbox", 1 << 13, 1 << 30)],
@@ -177,7 +194,7 @@ if (mode === "core") {
   }
   fs.rmSync(tmp, { recursive: true, force: true });
   P = String(o.partitions);
-  prod = "1";
+  prod = String(o.producers);
 } else {
   die(`--mode: unknown ${mode}`);
 }

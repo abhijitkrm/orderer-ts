@@ -59,9 +59,12 @@ The runnable version is `examples/quickstart.ts`.
 
 ## Limits
 
-- One publishing thread: the pipeline's owner. The ring library supports
-  multi-producer rings across workers (`MultiProducer`, tested with four
-  worker producers), but a `Pipeline` publishes only from its owner.
+- Any thread can publish: `pipeline.handleDescriptor()` goes to a worker
+  through `workerData`, and `new Handle(descriptor)` publishes from there
+  (up to 64 handles at once). Egress plugs still run on the owner thread,
+  which must keep pumping (`pumpWhile`, `drain`, or an idle event loop)
+  while workers publish. Measured: extra producers do not raise throughput,
+  because the owner's egress pump, not publishing, is the bottleneck.
 - matcher-ts holds ids, prices and quantities as JS numbers. Values beyond
   ±2^53 are rejected as malformed input rather than rounded.
 

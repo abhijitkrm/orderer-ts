@@ -2,6 +2,7 @@
 // control,plugs}.rs, ported). One publishing thread: where the Rust tests use
 // several producers, these interleave several streams from the owner thread.
 import * as fs from "fs";
+import { Worker } from "worker_threads";
 import * as path from "path";
 import { Side, Tif, cancel, eventCanonical, newLimit } from "../src/matcher/types";
 import { EvtMsg } from "../src/msg";
@@ -421,6 +422,48 @@ function appendContinuesTheLastSegmentAfterACheckpoint(): void {
   check(readCmdDir(dir, "binary").partitions.flat().length === 1200, "800 checkpointed away");
 }
 
+// ---- publishing from worker threads -------------------------------------------------------------
+
+/// Start one publisher worker per entry; returns [done flags, Ok counts] in shared memory.
+function startPublishers(data: object[]): Int32Array {
+  const shared = new Int32Array(new SharedArrayBuffer(8 * data.length)); // [done…, ok…]
+  data.forEach((d, i) => {
+    const w = new Worker(path.join(__dirname, "publisher.js"), { workerData: { ...d, shared: shared.buffer, index: i, n: data.length } });
+    w.unref();
+  });
+  return shared;
+}
+
+const allDone = (s: Int32Array, n: number) => Array.from({ length: n }, (_, i) => Atomics.load(s, i)).every((v) => v === 1);
+
+function workerStreamsPreservePerSymbolOrder(): void {
+  const cmds = fuzzCorpus(3, 20000, 16);
+  const [f, h] = collect(true);
+  const p = Pipeline.builder().bookConfig(CFG).partitions(4).ringSizes(256, 64, 64).egress(f).build();
+  const data = [0, 1, 2, 3].map((k) => ({ desc: p.handleDescriptor(), mode: "stream", cmds: cmds.filter(([s]) => s % 4 === k) }));
+  const shared = startPublishers(data);
+  p.pumpWhile(() => !allDone(shared, 4));
+  p.drain();
+  p.shutdown();
+  check(bySymbol(lines(h.listing())) === bySymbol(referenceLines(CFG, cmds)), "per-symbol order across worker publishers");
+}
+
+function everyOkPublishRacingShutdownIsApplied(): void {
+  for (let round = 0; round < 3; round++) {
+    const [f, h] = collect(true);
+    const p = Pipeline.builder().core("noop").partitions(2).ringSizes(64, 16, 16).egress(f).build();
+    const data = [0, 1, 2].map((k) => ({ desc: p.handleDescriptor(), mode: "race", sym: k }));
+    const shared = startPublishers(data);
+    p.pumpWhile(() => Atomics.load(shared, 3) + Atomics.load(shared, 4) + Atomics.load(shared, 5) < 3000);
+    p.shutdown();
+    const deadline = performance.now() + 10_000;
+    while (!allDone(shared, 3) && performance.now() < deadline) sleepMs(1);
+    const accepted = Atomics.load(shared, 3) + Atomics.load(shared, 4) + Atomics.load(shared, 5);
+    check(allDone(shared, 3), "publishers saw Closed");
+    check(lines(h.listing()).length === accepted, `Ok ⇒ applied: ${lines(h.listing()).length} events for ${accepted} Ok publishes`);
+  }
+}
+
 const tests: Array<[string, () => void]> = [
   ["every_partition_count_matches_reference_per_symbol", everyPartitionCountMatchesReference],
   ["fuzz_runs_are_deterministic_per_partition", fuzzRunsAreDeterministic],
@@ -438,6 +481,8 @@ const tests: Array<[string, () => void]> = [
   ["noop_core_sees_every_command", noopCoreSeesEveryCommand],
   ["failing_core_fails_the_pipeline_instead_of_hanging", failingCoreFailsThePipelineInsteadOfHanging],
   ["failing_egress_fails_the_pipeline", failingEgressFailsThePipeline],
+  ["worker_streams_preserve_per_symbol_order", workerStreamsPreservePerSymbolOrder],
+  ["every_ok_publish_racing_shutdown_is_applied", everyOkPublishRacingShutdownIsApplied],
   ["crc32c_matches_the_spec_check_value", crc32cMatchesTheSpecCheckValue],
   ["checksums_catch_flipped_bits_anywhere", checksumsCatchFlippedBitsAnywhere],
   ["repair_cuts_only_a_torn_tail", repairCutsOnlyATornTail],

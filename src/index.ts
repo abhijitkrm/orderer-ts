@@ -8,3 +8,4 @@ export * from "./egress";
 export * from "./pipeline";
 export * from "./recover";
 export * as matcher from "./matcher/index";
+export * from "./handle";

@@ -47,6 +47,17 @@ numbers are float64, exact to 2^53, which is matcher-ts's own range.
   the pipeline-wide alert word every ring checks. The owner reports it from
   `drain`, `snapshot` or `shutdown` as `PipelineError("failed")`.
 
+## Publishing from other threads
+
+The ingress ring is multi-producer (`Atomics.add` claims, per-slot
+availability laps). A `Handle` is built from a `HandleDescriptor` (the ring,
+a shared control block, the pipeline's absolute-time epoch, and a slot) and
+works on any thread; the owner publishes through one too. Each handle's
+in-flight flag lives in the control block: shutdown sets the closed flag,
+waits until no flag is raised (pumping egress meanwhile, since a blocked
+publisher may be waiting for room), then publishes the shutdown control.
+A publish that returned Ok is therefore applied, whichever thread made it.
+
 ## The owner thread
 
 Egress plugs are user objects, so they run on the owner thread. Each

@@ -23,8 +23,9 @@ import {
 } from "./journal";
 import { CMD_SLOT, Control, EVT_SLOT, EvtView, evtArg, evtCtl, evtIseq, writeCmd, writeCtl } from "./msg";
 import { PartitionMap } from "./routing";
-import { Consumer, Publish, RingShared, SingleProducer, WaitStrategy, backoff, busySpin, createRing, parkUs } from "./ring";
+import { Consumer, MultiProducer, Publish, RingShared, WaitStrategy, backoff, busySpin, createRing, parkUs } from "./ring";
 import { EngineData, EngineInitial, FAIL_BYTES, IoData, RouterData, readFailure, recordFailure } from "./worker";
+import { HANDLE_CTL_WORDS, Handle, HandleDescriptor, Status, anyInFlight, setClosed, setStamps, takeSlot } from "./handle";
 
 export type ErrorKind = "closed" | "full" | "failed" | "config" | "io";
 
@@ -34,12 +35,7 @@ export class PipelineError extends Error {
   }
 }
 
-/// Publish outcome: Ok means sequenced and will be applied — not durable.
-export enum Status {
-  Ok,
-  Closed,
-  Full,
-}
+export { Status } from "./handle";
 
 /// Wait strategy per stage (not observable).
 export interface Waits {
@@ -142,7 +138,11 @@ export class Pipeline {
   readonly partitions: number;
   readonly bookConfig: BookConfig;
   private readonly map: PartitionMap;
-  private readonly ingress: SingleProducer;
+  private readonly ingress: MultiProducer;
+  private readonly ingressShared: RingShared;
+  private readonly handleCtl = new SharedArrayBuffer(4 * HANDLE_CTL_WORDS);
+  private readonly epochAbsMs = performance.timeOrigin + performance.now();
+  private readonly owner: Handle;
   private readonly parts: EgressPart[] = [];
   private readonly workers: Worker[] = [];
   private readonly ports: MessagePort[] = [];
@@ -150,8 +150,7 @@ export class Pipeline {
   private readonly alert = new SharedArrayBuffer(4);
   private readonly exited: Int32Array;
   private readonly marks: BigInt64Array[] = [];
-  private readonly epochMs = performance.now();
-  private stamps: boolean;
+  private readonly epochMs = this.epochAbsMs - performance.timeOrigin;
   private closed = false;
   private shut = false;
   private nextEpoch = 0;
@@ -172,7 +171,7 @@ export class Pipeline {
     const P = map.partitions;
     this.partitions = P;
     this.bookConfig = o.book;
-    this.stamps = o.timestamps;
+    setStamps(this.handleCtl, o.timestamps);
     if (!pow2(o.rings.ingress) || !pow2(o.rings.inbox) || !pow2(o.rings.outbox))
       throw new PipelineError("config", "ring sizes must be powers of two >= 2");
     const nextIseq = Math.max(o.initial?.nextIseq ?? 1, 1);
@@ -274,12 +273,14 @@ export class Pipeline {
       };
       this.parts.push(part);
     }
-    const ingress = createRing(o.rings.ingress, CMD_SLOT, "single", [[]], this.alert);
+    const ingress = createRing(o.rings.ingress, CMD_SLOT, "multi", [[]], this.alert);
     const rd: RouterData = {
       ...common("router", "router"), role: "router", ingress, inboxes, partitions: P, table, nextIseq, wait: o.waits.router,
     };
     spawn(rd);
-    this.ingress = new SingleProducer(ingress);
+    this.ingressShared = ingress;
+    this.ingress = new MultiProducer(ingress);
+    this.owner = new Handle(this.handleDescriptor(), this.pumpFn);
     this.timer = setInterval(this.pumpFn, 1);
     this.timer.unref();
   }
@@ -288,43 +289,41 @@ export class Pipeline {
     return this.map.partition(sym);
   }
   setTimestamps(on: boolean): void {
-    this.stamps = on;
+    setStamps(this.handleCtl, on);
+  }
+
+  /// A publishing handle for another thread: pass the descriptor through
+  /// `workerData` and build `new Handle(descriptor)` there. Up to
+  /// MAX_HANDLES handles exist at once (the owner's is one); `close()` frees
+  /// a slot. While other threads publish, the owner must keep pumping
+  /// (`pumpWhile`, `drain`, or an idle event loop).
+  handleDescriptor(): HandleDescriptor {
+    const slot = takeSlot(this.handleCtl);
+    if (slot < 0) throw new PipelineError("config", "too many handles");
+    return { ingress: this.ingressShared, ctl: this.handleCtl, epochAbsMs: this.epochAbsMs, slot };
+  }
+
+  /// Pump egress until `busy()` turns false (e.g. while worker threads publish).
+  pumpWhile(busy: () => boolean): void {
+    this.waitUntil(() => !busy());
   }
   durableIseq(p: number): number {
     return this.marks.length === 0 ? Infinity : Number(Atomics.load(this.marks[p], 1));
   }
 
-  private now(): number {
-    return this.stamps ? Math.max(Math.round((performance.now() - this.epochMs) * 1e6), 1) : 0;
-  }
-
   /// Sequence one command (waits — pumping egress — while ingress is full).
   publish(sym: number, cmd: Command): Status {
-    if (this.closed) return Status.Closed;
-    const off = this.ingress.stage(this.pumpFn);
-    if (off < 0) return Status.Closed;
-    writeCmd(this.ingress.view, off, sym, cmd, this.now());
-    this.ingress.commit();
-    return Status.Ok;
+    return this.closed ? Status.Closed : this.owner.publish(sym, cmd);
   }
 
   /// Sequence one command, or Full without waiting.
   tryPublish(sym: number, cmd: Command): Status {
-    if (this.closed) return Status.Closed;
-    if (!this.ingress.hasRoom(1)) return Status.Full;
-    return this.publish(sym, cmd);
+    return this.closed ? Status.Closed : this.owner.tryPublish(sym, cmd);
   }
 
   /// Many commands, one claim per chunk (consecutive iseqs within a chunk).
   publishBatch(cmds: ReadonlyArray<readonly [number, Command]>, from = 0, to = cmds.length): Status {
-    if (this.closed) return Status.Closed;
-    const chunk = Math.min(this.ingress.size, 256);
-    for (let off = from; off < to; off += chunk) {
-      const k = Math.min(chunk, to - off), t = this.now();
-      const r = this.ingress.publishBatch(k, (i, v, o) => writeCmd(v, o, cmds[off + i][0], cmds[off + i][1], t), this.pumpFn);
-      if (r !== Publish.Ok) return Status.Closed;
-    }
-    return Status.Ok;
+    return this.closed ? Status.Closed : this.owner.publishBatch(cmds, from, to);
   }
 
   private failure(): string | undefined {
@@ -385,13 +384,11 @@ export class Pipeline {
     }
   }
 
-  private publishCtl(c: Control, arg: number): void {
+  private publishCtl(c: Control, arg: number, closing = false): void {
     this.check();
-    if (this.closed) throw new PipelineError("closed", "pipeline closed");
-    const off = this.ingress.stage(this.pumpFn);
-    if (off < 0) throw new PipelineError("closed", "pipeline closed");
-    writeCtl(this.ingress.view, off, c, arg);
-    this.ingress.commit();
+    if (this.closed && !closing) throw new PipelineError("closed", "pipeline closed");
+    if (this.ingress.publishBatch(1, (_i, v, o) => writeCtl(v, o, c, arg), this.pumpFn) !== Publish.Ok)
+      throw new PipelineError("closed", "pipeline closed");
   }
 
   /// Barrier: returns once every command published before the call has been
@@ -456,14 +453,21 @@ export class Pipeline {
     if (this.shut) return this.check();
     this.shut = true;
     clearInterval(this.timer);
+    // close, then wait out publishes already in flight on any thread
+    this.closed = true;
+    setClosed(this.handleCtl);
+    try {
+      this.waitUntil(() => !anyInFlight(this.handleCtl));
+    } catch {
+      /* failure reported below */
+    }
     if (this.failure() === undefined) {
       try {
-        this.publishCtl(Control.Shutdown, 0);
+        this.publishCtl(Control.Shutdown, 0, true);
       } catch {
         /* failure reported below */
       }
     }
-    this.closed = true;
     try {
       this.waitUntil(() => this.parts.every((p) => p.stopped));
     } catch {

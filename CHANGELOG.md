@@ -9,6 +9,9 @@
   and removes covered segments.
 - `orderrun --checkpoint-every K` and `--durable`; `scripts/test.sh` runs the
   vendored `spec/conformance.sh`.
+- Publishing from any thread: multi-producer ingress, `Handle` /
+  `Pipeline.handleDescriptor()` / `pumpWhile`; `orderbench --producers N`
+  uses worker producers.
 - Harness corpora are parsed line by line from a Buffer (files over V8's
   string limit).
 
