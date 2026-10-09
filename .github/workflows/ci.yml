@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: abhijitkrm/matcher-ts
-          ref: 0ef59a2b822b424fb6656b44f0406d19321b0d27
+          ref: 223341edc68773895ae0202a8bc2d237c9e4d8f5
           path: upstream/matcher-ts
       - run: cd upstream/matcher-ts && npm ci
       - uses: dtolnay/rust-toolchain@stable

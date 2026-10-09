@@ -25,7 +25,8 @@ export enum IndexKind {
 }
 
 // ---------------------------------------------------------------------------
-// Ladder: levels[p - base] + occupancy bitmap + best-price cursor.
+// Ladder: levels[p - base] + occupancy bitmap + best-price cursor. summary
+// bit w is set iff bits[w] !== 0, so rescan skips 1024 empty ticks per word.
 // ---------------------------------------------------------------------------
 
 export class LadderIndex {
@@ -33,6 +34,7 @@ export class LadderIndex {
   readonly base: Price;
   readonly levels: Level[];
   readonly bits: Uint32Array;
+  readonly summary: Uint32Array;
   best = NIL;
   count = 0;
 
@@ -43,6 +45,7 @@ export class LadderIndex {
     this.levels = new Array<Level>(span);
     for (let i = 0; i < span; i++) this.levels[i] = emptyLevel();
     this.bits = new Uint32Array((span + 31) >> 5);
+    this.summary = new Uint32Array((this.bits.length + 31) >> 5);
   }
 
   private idx(p: Price): number {
@@ -66,6 +69,7 @@ export class LadderIndex {
     const l = this.levels[i];
     if (isEmpty(l)) {
       this.bits[i >> 5] |= 1 << (i & 31);
+      this.summary[i >> 10] |= 1 << ((i >> 5) & 31);
       this.count++;
       if (this.best === NIL ||
           (this.side === Side.Ask ? i < this.best : i > this.best)) {
@@ -78,37 +82,46 @@ export class LadderIndex {
   unlinkLevel(p: Price): void {
     const i = this.idx(p);
     if (i < 0 || i >= this.levels.length || !isEmpty(this.levels[i])) return;
-    this.bits[i >> 5] &= ~(1 << (i & 31));
+    const w = i >> 5;
+    this.bits[w] &= ~(1 << (i & 31));
+    if (this.bits[w] === 0) this.summary[w >> 5] &= ~(1 << (w & 31));
     this.count--;
-    if (i === this.best) this.best = this.rescan(i);
+    if (this.count === 0) this.best = NIL;
+    else if (i === this.best) this.best = this.rescan(i);
   }
 
   /// Nearest non-empty level strictly beyond `from`; NIL if the book emptied.
+  /// Searches `from`'s word, then finds the next non-empty word through the
+  /// summary.
   private rescan(from: number): number {
-    const n = this.levels.length;
+    const w = from >> 5;
+    const low = (x: number) => 31 - Math.clz32(x & -x); // lowest set bit
+    const high = (x: number) => 31 - Math.clz32(x); // highest set bit
     if (this.side === Side.Ask) {
-      for (let w = from >> 5; w < this.bits.length; w++) {
-        let word = this.bits[w];
-        if (w === from >> 5) {
-          const b = (from & 31) + 1;
-          word &= b === 32 ? 0 : ~0 << b;
+      const b = (from & 31) + 1;
+      const word = this.bits[w] & (b === 32 ? 0 : ~0 << b);
+      if (word !== 0) return (w << 5) + low(word);
+      for (let s = w + 1; s < this.bits.length; ) {
+        const sw = s >> 5;
+        const sword = this.summary[sw] & (~0 << (s & 31));
+        if (sword !== 0) {
+          const nw = (sw << 5) + low(sword);
+          return (nw << 5) + low(this.bits[nw]);
         }
-        if (word !== 0) {
-          const i = (w << 5) + (31 - Math.clz32(word & -word));
-          return i < n ? i : NIL;
-        }
+        s = (sw << 5) + 32;
       }
     } else {
-      for (let w = from >> 5; w >= 0; w--) {
-        let word = this.bits[w];
-        if (w === from >> 5) {
-          const b = from & 31;
-          word &= b === 0 ? 0 : ~0 >>> (32 - b);
+      const b = from & 31;
+      const word = this.bits[w] & (b === 0 ? 0 : ~0 >>> (32 - b));
+      if (word !== 0) return (w << 5) + high(word);
+      for (let s = w - 1; s >= 0; ) {
+        const sw = s >> 5;
+        const sword = this.summary[sw] & (~0 >>> (31 - (s & 31)));
+        if (sword !== 0) {
+          const nw = (sw << 5) + high(sword);
+          return (nw << 5) + high(this.bits[nw]);
         }
-        if (word !== 0) {
-          const i = (w << 5) + (31 - Math.clz32(word));
-          return i < n ? i : NIL;
-        }
+        s = (sw << 5) - 1;
       }
     }
     return NIL;

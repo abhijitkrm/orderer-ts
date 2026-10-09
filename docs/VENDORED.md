@@ -10,8 +10,8 @@ matcher's spec and corpus.
 
 - **upstream**: `orderer`
 - **repo**: `https://github.com/abhijitkrm/orderer`
-- **commit**: `21bf70c8880e08226d978cacb531522fa7a03b68`
-- **tag**: `orderer-spec/1.2` (draft)
+- **commit**: `6a46583cf1fc3aee1e5c2c935143b14d8d716067`
+- **tag**: `orderer-spec/1.2`, plus matcher `06b5403` (bench docs only)
 - **paths**: `spec=spec vectors=vectors`
 
 `docs/VENDORED.sha256` holds every file's checksum. `scripts/vendored.sh`
@@ -21,14 +21,14 @@ against the pinned commit.
 ## 2. The matching core
 
 `src/matcher/` is [matcher-ts](https://github.com/abhijitkrm/matcher-ts)'s
-`src/` at `0ef59a2b822b424fb6656b44f0406d19321b0d27`, byte for byte.
+`src/` at `223341edc68773895ae0202a8bc2d237c9e4d8f5`, byte for byte, which includes the ladder rescan fix (223341e).
 matcher-ts never had the OrderMap deletion bug fixed in matcher-rust and
 matcher-cpp; `vectors/regress/001_dense_map_churn` pins that.
 
 To check it:
 
 ```bash
-diff -r ../matcher-ts/src src/matcher && git -C ../matcher-ts diff --stat 0ef59a2b822b424fb6656b44f0406d19321b0d27 -- src
+diff -r ../matcher-ts/src src/matcher && git -C ../matcher-ts diff --stat 223341edc68773895ae0202a8bc2d237c9e4d8f5 -- src
 ```
 
 matcher-ts holds ids, prices and quantities as JS numbers, so orderer-ts
