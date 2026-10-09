@@ -13,7 +13,42 @@ import { get, i64, indexName, parseCommand, sameBook, u64, writeCommand } from "
 export type JournalFormat = "jsonl" | "binary";
 export type JournalKind = "cmd" | "evt";
 
-export const HEADER = 64, CMD_RECORD = 40, EVT_RECORD = 48, MAX_RECORD = 256;
+export const HEADER = 64, MAX_RECORD = 256, VERSION = 2;
+/// Version-2 record sizes (1.2): the version-1 record + CRC-32C + 4 reserved bytes.
+export const CMD_RECORD = 48, EVT_RECORD = 56, CMD_RECORD_V1 = 40, EVT_RECORD_V1 = 48;
+const payloadOf = (k: JournalKind) => (k === "cmd" ? CMD_RECORD_V1 : EVT_RECORD_V1);
+const recordSize = (k: JournalKind, version: number) => payloadOf(k) + (version === 1 ? 0 : 8);
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0x82f63b78 : c >>> 1;
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+
+/// CRC-32C (Castagnoli, reflected 0x82F63B78), spec/JOURNAL.md §2.2.
+export function crc32c(b: Uint8Array, from = 0, len = b.length - from): number {
+  let c = 0xffffffff;
+  for (let i = from; i < from + len; i++) c = CRC_TABLE[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function bytesOf(v: DataView): Uint8Array {
+  return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+}
+
+/// Seal a version-2 record at `o`: CRC-32C of the payload, then zeros.
+function seal(v: DataView, o: number, payload: number): void {
+  v.setUint32(o + payload, crc32c(bytesOf(v), o, payload), true);
+  v.setUint32(o + payload + 4, 0, true);
+}
+
+function sealed(v: DataView, o: number, payload: number): boolean {
+  return v.getUint32(o + payload, true) === crc32c(bytesOf(v), o, payload);
+}
 
 /// When the I/O worker fsyncs. Never observable (spec/PIPELINE.md §8).
 export type FsyncPolicy =
@@ -42,8 +77,73 @@ export class CorruptJournal extends Error {}
 
 const corrupt = (p: string, d: string) => new CorruptJournal(`${p}: ${d}`);
 
+const extOf = (f: JournalFormat) => (f === "jsonl" ? ".journal" : ".bin");
+
+/// spec/JOURNAL.md §1: segment 0's file.
 export function journalPath(dir: string, k: JournalKind, p: number, f: JournalFormat): string {
-  return path.join(dir, `${k}-${p}${f === "jsonl" ? ".journal" : ".bin"}`);
+  return segmentPath(dir, k, p, 0, f);
+}
+
+/// spec/JOURNAL.md §1: the segment starting after cut `start`.
+export function segmentPath(dir: string, k: JournalKind, p: number, start: number, f: JournalFormat): string {
+  return path.join(dir, `${k}-${p}${start === 0 ? "" : "." + start}${extOf(f)}`);
+}
+
+export interface Segment {
+  partition: number;
+  start: number;
+  path: string;
+}
+
+const UINT = /^[0-9]+$/;
+
+/// Every `k` segment in `dir`, sorted by (partition, start).
+export function listSegments(dir: string, k: JournalKind, f: JournalFormat): Segment[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const prefix = k + "-", suffix = extOf(f);
+  const out: Segment[] = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(suffix) || name.length <= prefix.length + suffix.length) continue;
+    const mid = name.slice(prefix.length, name.length - suffix.length);
+    const dot = mid.indexOf(".");
+    const ps = dot < 0 ? mid : mid.slice(0, dot), ss = dot < 0 ? "0" : mid.slice(dot + 1);
+    if (!UINT.test(ps) || !UINT.test(ss)) continue;
+    const p = Number(ps), start = Number(ss);
+    if (p > 0xffffffff || !Number.isSafeInteger(start) || (dot >= 0 && start === 0)) continue;
+    out.push({ partition: p, start, path: path.join(dir, name) });
+  }
+  return out.sort((a, b) => a.partition - b.partition || a.start - b.start);
+}
+
+/// spec/JOURNAL.md §6: checkpoint snapshot path for cut `n`.
+export function checkpointPath(dir: string, n: number): string {
+  return path.join(dir, `checkpoint-${n}.snap`);
+}
+
+/// Checkpoints with cut below `below`, ascending; `complete` = with sidecar.
+export function listCheckpoints(dir: string, complete = true, below = Infinity): Array<{ cut: number; path: string }> {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: Array<{ cut: number; path: string }> = [];
+  for (const name of names) {
+    const m = /^checkpoint-([0-9]+)\.snap$/.exec(name);
+    if (m === null) continue;
+    const n = Number(m[1]);
+    if (!Number.isSafeInteger(n) || n >= below) continue;
+    const p = path.join(dir, name);
+    if (complete && !fs.existsSync(p + ".meta")) continue;
+    out.push({ cut: n, path: p });
+  }
+  return out.sort((a, b) => a.cut - b.cut);
 }
 
 // ---- 64-bit helpers (numbers exact to 2^53) -------------------------------------------------
@@ -74,12 +174,12 @@ export function binaryHeader(k: JournalKind, p: number, P: number, b: BookConfig
   const h = new Uint8Array(HEADER);
   const v = new DataView(h.buffer);
   h.set([0x4f, 0x52, 0x44, 0x4a]); // "ORDJ"
-  v.setUint16(4, 1, true);
+  v.setUint16(4, VERSION, true);
   h[6] = k === "cmd" ? 1 : 2;
   h[7] = b.index === IndexKind.Tree ? 1 : 0;
   v.setUint32(8, p, true);
   v.setUint32(12, P, true);
-  v.setUint32(16, k === "cmd" ? CMD_RECORD : EVT_RECORD, true);
+  v.setUint32(16, recordSize(k, VERSION), true);
   setI64(v, 24, b.priceMin);
   setI64(v, 32, b.priceMax);
   setI64(v, 40, b.maxOrders);
@@ -114,6 +214,7 @@ export function encodeCmd(iseq: number, sym: number, c: Command, v: DataView, o:
   setI64(v, o + 16, c.orderId);
   setI64(v, o + 24, price);
   setI64(v, o + 32, qty);
+  seal(v, o, CMD_RECORD_V1);
 }
 
 export interface CmdRecord {
@@ -157,6 +258,7 @@ export function encodeEvt(seq: number, sym: number, e: Event, v: DataView, o: nu
   setI64(v, o + 24, b);
   setI64(v, o + 32, c);
   setI64(v, o + 40, d);
+  seal(v, o, EVT_RECORD_V1);
 }
 
 function decodeEvt(v: DataView, o: number): string | undefined {
@@ -178,11 +280,13 @@ function decodeEvt(v: DataView, o: number): string | undefined {
 
 // ---- reading (recovery) ------------------------------------------------------------------------
 
+/// `version` is the binary journal version (JSONL reports 2); not part of sameHeader.
 export interface JournalHeader {
   kind: JournalKind;
   partition: number;
   partitions: number;
   book: BookConfig;
+  version: number;
 }
 
 function parseJsonlHeader(p: string, line: string): JournalHeader {
@@ -197,20 +301,22 @@ function parseJsonlHeader(p: string, line: string): JournalHeader {
   if (pmax === undefined) throw corrupt(p, "bad pmax");
   if (mo === undefined) throw corrupt(p, "bad max_orders");
   if (ix !== "ladder" && ix !== "tree") throw corrupt(p, "bad index");
-  return { kind: k, partition: part, partitions: parts, book: { priceMin: pmin, priceMax: pmax, maxOrders: mo, index: ix === "tree" ? IndexKind.Tree : IndexKind.Ladder } };
+  return { kind: k, partition: part, partitions: parts, version: VERSION,
+    book: { priceMin: pmin, priceMax: pmax, maxOrders: mo, index: ix === "tree" ? IndexKind.Tree : IndexKind.Ladder } };
 }
 
 function parseBinaryHeader(p: string, b: Buffer): JournalHeader {
   if (b.length < HEADER || b.toString("latin1", 0, 4) !== "ORDJ") throw corrupt(p, "bad magic");
   const v = new DataView(b.buffer, b.byteOffset, b.length);
-  if (v.getUint16(4, true) !== 1) throw corrupt(p, "unsupported version");
+  const version = v.getUint16(4, true);
+  if (version !== 1 && version !== 2) throw corrupt(p, "unsupported version");
   const kind: JournalKind | undefined = b[6] === 1 ? "cmd" : b[6] === 2 ? "evt" : undefined;
   if (kind === undefined) throw corrupt(p, "bad kind");
-  if (v.getUint32(16, true) !== (kind === "cmd" ? CMD_RECORD : EVT_RECORD)) throw corrupt(p, "bad record_size");
+  if (v.getUint32(16, true) !== recordSize(kind, version)) throw corrupt(p, "bad record_size");
   if (b[7] > 1) throw corrupt(p, "bad index");
   const pmin = getI64(v, 24, true), pmax = getI64(v, 32, true), mo = getI64(v, 40, false);
   if (pmin === undefined || pmax === undefined || mo === undefined) throw corrupt(p, "header value beyond 2^53");
-  return { kind, partition: v.getUint32(8, true), partitions: v.getUint32(12, true),
+  return { kind, partition: v.getUint32(8, true), partitions: v.getUint32(12, true), version,
     book: { priceMin: pmin, priceMax: pmax, maxOrders: mo, index: b[7] === 1 ? IndexKind.Tree : IndexKind.Ladder } };
 }
 
@@ -230,76 +336,144 @@ export function readHeader(p: string, f: JournalFormat): JournalHeader {
   return parseJsonlHeader(p, nl < 0 ? t : t.slice(0, nl));
 }
 
-function jsonlLines(p: string, b: Buffer): string[] {
-  if (b.length > 0 && b[b.length - 1] !== 10) throw corrupt(p, "torn tail (final line has no newline)");
-  const t = b.toString("utf8");
-  return t === "" ? [] : t.slice(0, -1).split("\n");
+/// Strict (default) or repair reading (spec/JOURNAL.md §5, §5.1).
+export type ReadMode = "strict" | "repair";
+
+interface Body {
+  header: JournalHeader;
+  records: Array<[number, number]>; // offset, length (binary: already checksum-checked)
+  validLen: number; // bytes a repair keeps
 }
 
+function splitBody(p: string, b: Buffer, f: JournalFormat, mode: ReadMode): Body {
+  if (f === "binary") {
+    const header = parseBinaryHeader(p, b);
+    const size = recordSize(header.kind, header.version), body = b.length - HEADER;
+    let n = Math.floor(body / size);
+    if (body % size !== 0 && mode === "strict") throw corrupt(p, "torn tail (partial record)");
+    const v = new DataView(b.buffer, b.byteOffset, b.length);
+    if (header.version >= 2) {
+      for (let i = 0; i < n; i++) {
+        if (!sealed(v, HEADER + i * size, payloadOf(header.kind))) {
+          if (mode === "repair" && i + 1 === n) { n--; break; } // a torn final record (§5.1)
+          throw corrupt(p, `record ${i}: checksum mismatch`);
+        }
+      }
+    }
+    const records: Array<[number, number]> = [];
+    for (let i = 0; i < n; i++) records.push([HEADER + i * size, size]);
+    return { header, records, validLen: HEADER + n * size };
+  }
+  let end = b.length;
+  if (end > 0 && b[end - 1] !== 10) {
+    if (mode === "strict") throw corrupt(p, "torn tail (final line has no newline)");
+    end = b.lastIndexOf(10) + 1;
+  }
+  let first = b.indexOf(10);
+  if (first < 0 || first > end) first = end;
+  const header = parseJsonlHeader(p, b.toString("utf8", 0, first));
+  const records: Array<[number, number]> = [];
+  for (let pos = first + 1; pos < end; ) {
+    const e = b.indexOf(10, pos);
+    records.push([pos, e - pos]);
+    pos = e + 1;
+  }
+  return { header, records, validLen: end };
+}
+
+function decodeCmds(p: string, b: Buffer, f: JournalFormat, body: Body): CmdRecord[] {
+  const v = new DataView(b.buffer, b.byteOffset, b.length);
+  return body.records.map(([off, len], i) => {
+    if (f === "binary") {
+      const r = decodeCmd(v, off);
+      if (r === undefined) throw corrupt(p, `record ${i}: bad codes`);
+      return r;
+    }
+    const l = b.toString("utf8", off, off + len);
+    const iseq = u64(l, "iseq"), sym = u64(l, "symbol"), cmd = parseCommand(l);
+    if (iseq === undefined || sym === undefined || sym > 0xffffffff || cmd === undefined)
+      throw corrupt(p, `line ${i + 2}: malformed record: ${l}`);
+    return { iseq, sym, cmd };
+  });
+}
+
+function checkIncreasing(p: string, recs: CmdRecord[], after?: number): void {
+  for (const r of recs) {
+    if (after !== undefined && r.iseq <= after) throw corrupt(p, `iseq not increasing (${after} then ${r.iseq})`);
+    after = r.iseq;
+  }
+}
+
+/// One command journal file, strictly.
 export function readCmdJournal(p: string, f: JournalFormat): { header: JournalHeader; records: CmdRecord[] } {
   const b = readFile(p);
-  let header: JournalHeader;
-  const records: CmdRecord[] = [];
-  if (f === "binary") {
-    header = parseBinaryHeader(p, b);
-    const body = b.length - HEADER;
-    if (body % CMD_RECORD !== 0) throw corrupt(p, "torn tail (partial record)");
-    const v = new DataView(b.buffer, b.byteOffset, b.length);
-    for (let i = 0; i < body / CMD_RECORD; i++) {
-      const r = decodeCmd(v, HEADER + i * CMD_RECORD);
-      if (r === undefined) throw corrupt(p, `record ${i}: bad codes`);
-      records.push(r);
-    }
-  } else {
-    const lines = jsonlLines(p, b);
-    header = parseJsonlHeader(p, lines[0] ?? "");
-    for (let i = 1; i < lines.length; i++) {
-      const l = lines[i];
-      const iseq = u64(l, "iseq"), sym = u64(l, "symbol"), cmd = parseCommand(l);
-      if (iseq === undefined || sym === undefined || sym > 0xffffffff || cmd === undefined)
-        throw corrupt(p, `line ${i + 1}: malformed record: ${l}`);
-      records.push({ iseq, sym, cmd });
-    }
-  }
-  if (header.kind !== "cmd") throw corrupt(p, "not a command journal");
-  for (let i = 1; i < records.length; i++)
-    if (records[i].iseq <= records[i - 1].iseq)
-      throw corrupt(p, `iseq not increasing (${records[i - 1].iseq} then ${records[i].iseq})`);
-  return { header, records };
+  const body = splitBody(p, b, f, "strict");
+  if (body.header.kind !== "cmd") throw corrupt(p, "not a command journal");
+  const records = decodeCmds(p, b, f, body);
+  checkIncreasing(p, records);
+  return { header: body.header, records };
 }
 
+/// Every partition's command journal in `dir`, all segments in order (spec/JOURNAL.md §1, §5).
 export function readCmdDir(dir: string, f: JournalFormat): { header: JournalHeader; partitions: CmdRecord[][] } {
-  const first = journalPath(dir, "cmd", 0, f);
-  const c0 = readCmdJournal(first, f);
-  if (c0.header.partition !== 0) throw corrupt(first, "header partition is not 0");
-  const partitions = [c0.records];
-  for (let p = 1; p < c0.header.partitions; p++) {
-    const pth = journalPath(dir, "cmd", p, f);
-    const c = readCmdJournal(pth, f);
-    if (c.header.partition !== p || c.header.partitions !== c0.header.partitions || !sameBook(c.header.book, c0.header.book))
-      throw corrupt(pth, "header does not match its file name, partition count or book config");
-    partitions.push(c.records);
+  const segs = listSegments(dir, "cmd", f);
+  if (segs.length === 0) throw corrupt(journalPath(dir, "cmd", 0, f), "no command journal");
+  const h0 = readHeader(segs[0].path, f);
+  const partitions: CmdRecord[][] = Array.from({ length: h0.partitions }, () => []);
+  const seen = new Array<boolean>(h0.partitions).fill(false);
+  for (const s of segs) {
+    const c = readCmdJournal(s.path, f);
+    const h = c.header;
+    if (h.partition !== s.partition || s.partition >= h0.partitions || h.partitions !== h0.partitions || !sameBook(h.book, h0.book))
+      throw corrupt(s.path, "header does not match its file name, partition count or book config");
+    const part = partitions[s.partition];
+    checkIncreasing(s.path, c.records, part.length > 0 ? part[part.length - 1].iseq : undefined);
+    for (const r of c.records) part.push(r);
+    seen[s.partition] = true;
   }
-  return { header: c0.header, partitions };
+  const missing = seen.indexOf(false);
+  if (missing >= 0) throw corrupt(journalPath(dir, "cmd", missing, f), "partition has no journal");
+  return { header: h0, partitions };
 }
 
-/// An event journal as canonical symbol-tagged lines.
+/// An event journal file as canonical symbol-tagged lines.
 export function readEvtJournal(p: string, f: JournalFormat): string[] {
   const b = readFile(p);
-  if (f === "jsonl") {
-    const lines = jsonlLines(p, b);
-    parseJsonlHeader(p, lines[0] ?? "");
-    return lines.slice(1);
-  }
-  parseBinaryHeader(p, b);
-  const body = b.length - HEADER;
-  if (body % EVT_RECORD !== 0) throw corrupt(p, "torn tail (partial record)");
+  const body = splitBody(p, b, f, "strict");
   const v = new DataView(b.buffer, b.byteOffset, b.length);
-  const out: string[] = [];
-  for (let i = 0; i < body / EVT_RECORD; i++) {
-    const l = decodeEvt(v, HEADER + i * EVT_RECORD);
+  return body.records.map(([off, len], i) => {
+    if (f === "jsonl") return b.toString("utf8", off, off + len);
+    const l = decodeEvt(v, off);
     if (l === undefined) throw corrupt(p, `record ${i}: bad codes`);
-    out.push(l);
+    return l;
+  });
+}
+
+/// A partition's whole event journal (all segments, in order).
+export function readEvtPartition(dir: string, f: JournalFormat, p: number): string[] {
+  return listSegments(dir, "evt", f).filter((s) => s.partition === p).flatMap((s) => readEvtJournal(s.path, f));
+}
+
+/// spec/JOURNAL.md §5.1: truncate a torn tail off each journal family's last segment, in place.
+export function repairDir(dir: string, f: JournalFormat): Array<{ path: string; bytes: number }> {
+  const out: Array<{ path: string; bytes: number }> = [];
+  for (const k of ["cmd", "evt"] as JournalKind[]) {
+    const last = new Map<number, string>();
+    for (const s of listSegments(dir, k, f)) last.set(s.partition, s.path);
+    for (const p of last.values()) {
+      const b = readFile(p);
+      const body = splitBody(p, b, f, "repair");
+      if (body.validLen < b.length) {
+        const fd = fs.openSync(p, "r+");
+        try {
+          fs.ftruncateSync(fd, body.validLen);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        out.push({ path: p, bytes: b.length - body.validLen });
+      }
+    }
   }
   return out;
 }
@@ -315,19 +489,68 @@ export function mergeJournals(parts: CmdRecord[][], after: number): CmdRecord[] 
 
 // ---- writing -----------------------------------------------------------------------------------
 
-/// Create (header written) or check for append (header checked); returns
-/// the path, which the journal's I/O worker opens for appending.
-export function openJournal(cfg: JournalConfig, k: JournalKind, p: number, P: number, book: BookConfig): string {
-  const pth = journalPath(cfg.dir, k, p, cfg.format);
-  if (cfg.append && fs.existsSync(pth)) {
-    const h = readHeader(pth, cfg.format);
-    if (h.kind !== k || h.partition !== p || h.partitions !== P || !sameBook(h.book, book))
-      throw corrupt(pth, "header does not match the pipeline");
-    fs.accessSync(pth, fs.constants.W_OK);
-    return pth;
-  }
-  fs.writeFileSync(pth, cfg.format === "jsonl" ? Buffer.from(jsonlHeader(k, p, P, book)) : binaryHeader(k, p, P, book));
+/// Create segment `start` (truncating any old file) with its header; returns its path.
+export function openSegment(dir: string, f: JournalFormat, k: JournalKind, p: number, P: number, book: BookConfig, start: number): string {
+  const pth = segmentPath(dir, k, p, start, f);
+  fs.writeFileSync(pth, f === "jsonl" ? Buffer.from(jsonlHeader(k, p, P, book)) : binaryHeader(k, p, P, book));
   return pth;
+}
+
+/// Append mode: the partition's last segment (header checked); otherwise a
+/// fresh segment 0. Returns the path the journal's I/O worker opens for appending.
+export function openJournal(cfg: JournalConfig, k: JournalKind, p: number, P: number, book: BookConfig): string {
+  if (cfg.append) {
+    const segs = listSegments(cfg.dir, k, cfg.format).filter((s) => s.partition === p);
+    if (segs.length > 0) {
+      const last = segs[segs.length - 1].path;
+      const h = readHeader(last, cfg.format);
+      if (h.kind !== k || h.partition !== p || h.partitions !== P || !sameBook(h.book, book))
+        throw corrupt(last, "header does not match the pipeline");
+      if (cfg.format === "binary" && h.version !== VERSION) throw corrupt(last, "cannot append to a version-1 journal");
+      fs.accessSync(last, fs.constants.W_OK);
+      return last;
+    }
+  }
+  return openSegment(cfg.dir, cfg.format, k, p, P, book, 0);
+}
+
+/// Remove checkpoints with cut below `n` (body first).
+export function removeCheckpointsBelow(dir: string, n: number): void {
+  for (const c of listCheckpoints(dir, false, n)) {
+    fs.rmSync(c.path, { force: true });
+    fs.rmSync(c.path + ".meta", { force: true });
+  }
+}
+
+/// spec/JOURNAL.md §6 step 4: remove segments that start below `n`.
+export function removeSegmentsBelow(dir: string, f: JournalFormat, n: number): void {
+  for (const k of ["cmd", "evt"] as JournalKind[])
+    for (const s of listSegments(dir, k, f)) if (s.start < n) fs.rmSync(s.path, { force: true });
+}
+
+/// A fresh (non-append) pipeline owns its directory's journals.
+export function clearJournalDir(dir: string, f: JournalFormat): void {
+  removeSegmentsBelow(dir, f, Infinity);
+  removeCheckpointsBelow(dir, Infinity);
+}
+
+/// Write `contents` durably: temporary name, sync, rename, sync the directory.
+export function writeDurably(p: string, contents: string): void {
+  const tmp = p + ".tmp";
+  const fd = fs.openSync(tmp, "w");
+  try {
+    fs.writeSync(fd, contents);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, p);
+  try {
+    const d = fs.openSync(path.dirname(p), "r");
+    try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
+  } catch {
+    /* some platforms cannot sync a directory */
+  }
 }
 
 // ---- the chunk writer ----------------------------------------------------------------------------
@@ -344,8 +567,11 @@ const TO_HEAD = 0, TO_TAIL = 1, FREE_HEAD = 2, FREE_TAIL = 3, DONE = 4, ERR_LEN 
 const TOQ = CTRL, FREEQ = CTRL + Q, CTRL_WORDS = CTRL + 2 * Q;
 const META_OFF = CTRL_WORDS * 4; // float64 × 3 per chunk: len, last id, records
 const ERR_OFF = META_OFF + CHUNKS * 24, ERR_BYTES = 1024;
-const DATA_OFF = Math.ceil((ERR_OFF + ERR_BYTES) / 64) * 64;
+// rotation slots: the next segment's path, handed to the I/O worker (§6 step 2)
+const ROT_SLOTS = 8, ROT_BYTES = 1024, ROT_OFF = ERR_OFF + ERR_BYTES;
+const DATA_OFF = Math.ceil((ROT_OFF + ROT_SLOTS * (ROT_BYTES + 4)) / 64) * 64;
 const STOP = -1;
+const ROTATE = -2; // -2 - slot
 
 /// Everything the I/O worker needs.
 export interface ChunkShared {
@@ -439,6 +665,19 @@ export class ChunkWriter {
     Atomics.store(this.ctl, TO_TAIL, tail + 1);
     Atomics.notify(this.ctl, TO_TAIL);
   }
+  private rotations = 0;
+  /// Continue in the segment at `next` (header written): everything so far
+  /// goes to the current file, which the I/O worker syncs per policy and closes.
+  rotate(next: string): void {
+    this.handOff();
+    const slot = this.rotations++ % ROT_SLOTS;
+    const b = Buffer.from(next, "utf8");
+    if (b.length > ROT_BYTES) throw new Error(`segment path too long: ${next}`);
+    const v = new DataView(this.shared.sab);
+    v.setUint32(ROT_OFF + slot * (ROT_BYTES + 4), b.length, true);
+    new Uint8Array(this.shared.sab, ROT_OFF + slot * (ROT_BYTES + 4) + 4, b.length).set(b);
+    this.enqueue(ROTATE - slot);
+  }
   /// Write and (per policy) sync everything; waits for the I/O worker. The first I/O error, if any.
   finish(): string | undefined {
     if (!this.finished) {
@@ -515,6 +754,20 @@ export function ioLoop(sh: ChunkShared, alert?: SharedArrayBuffer): void {
       if (c === STOP) {
         stop = true;
         break;
+      }
+      if (c <= ROTATE) {
+        const slot = ROTATE - c, at = ROT_OFF + slot * (ROT_BYTES + 4);
+        const len = new DataView(sh.sab).getUint32(at, true);
+        const next = Buffer.from(new Uint8Array(sh.sab, at + 4, len)).toString("utf8");
+        if (unsynced > 0 && sh.fsync !== null && sh.fsync.mode !== "never") sync();
+        unsynced = 0;
+        try {
+          fs.closeSync(fd);
+          fd = fs.openSync(next, "a");
+        } catch (e) {
+          setErr(`journal rotate: ${(e as Error).message}`);
+        }
+        continue;
       }
       const len = meta[c * 3];
       try {

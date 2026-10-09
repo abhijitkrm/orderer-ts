@@ -3,9 +3,9 @@
 import * as fs from "fs";
 import { BookConfig } from "./matcher/book";
 import { Command } from "./matcher/types";
-import { collect } from "./egress";
+import { acks, collect } from "./egress";
 import { get, parseCommand, parseHeader, parseU64, u64 } from "./flat";
-import { JournalConfig, fsyncNever, journalConfig } from "./journal";
+import { JournalConfig, fsyncEveryN, fsyncNever, journalConfig } from "./journal";
 import { Pipeline, Snapshot, Status } from "./pipeline";
 import { PartitionMap } from "./routing";
 
@@ -155,12 +155,36 @@ export function common(a: Args): Common {
   return c;
 }
 
+/// spec/HARNESS.md §4.1 options beyond the common ones (1.2).
+export interface RunOpts {
+  snapshot?: boolean;
+  checkpointEvery?: number; // --checkpoint-every K
+  durable?: boolean; // --durable
+}
+
 /// Run a corpus through a fresh pipeline (one producer, file order), drain,
 /// optionally snapshot, shut down. Returns the spec/HARNESS.md §3 listing.
-export function runCorpus(corpus: Corpus, c: Common, tagged: boolean, snapshot: boolean): { listing: string; snap?: Snapshot } {
+export function runCorpus(corpus: Corpus, c: Common, tagged: boolean, opt: boolean | RunOpts): { listing: string; snap?: Snapshot } {
+  const opts: RunOpts = typeof opt === "boolean" ? { snapshot: opt } : opt;
+  const snapshot = opts.snapshot === true;
   const [f, events] = collect(tagged);
   const b = Pipeline.builder().bookConfig(corpus.book).partitionMap(c.map).egress(f);
-  if (c.journal !== undefined) b.journal(c.journal);
+  if (c.journal !== undefined) {
+    const j = { ...c.journal };
+    if (opts.durable === true) {
+      j.fsync = fsyncEveryN(64);
+      const last = new Map<number, number>();
+      b.egress(acks((p, m) => {
+        if (last.get(p) !== m.iseq) {
+          last.set(p, m.iseq);
+          fs.writeSync(2, `acked ${p} ${m.iseq}\n`);
+        }
+      }));
+    }
+    b.journal(j);
+  } else if (opts.durable === true || opts.checkpointEvery !== undefined) {
+    die("--durable and --checkpoint-every need --journal-dir");
+  }
   let p: Pipeline;
   try {
     p = b.build();
@@ -169,7 +193,15 @@ export function runCorpus(corpus: Corpus, c: Common, tagged: boolean, snapshot: 
   }
   let snap: Snapshot | undefined;
   try {
-    if (p.publishBatch(corpus.cmds) !== Status.Ok) fail("pipeline closed");
+    const k = opts.checkpointEvery;
+    if (k !== undefined) {
+      if (k < 1) die("--checkpoint-every: K must be at least 1");
+      for (let off = 0; off < corpus.cmds.length; off += k) {
+        const n = Math.min(k, corpus.cmds.length - off);
+        if (p.publishBatch(corpus.cmds, off, off + n) !== Status.Ok) fail("pipeline closed");
+        if (n === k) p.checkpoint();
+      }
+    } else if (p.publishBatch(corpus.cmds) !== Status.Ok) fail("pipeline closed");
     p.drain();
     if (snapshot) snap = p.snapshot();
     p.shutdown();

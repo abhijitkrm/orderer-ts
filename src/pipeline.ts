@@ -17,8 +17,11 @@ import { BookConfig, defaultConfig } from "./matcher/book";
 import { Command } from "./matcher/types";
 import { Block, snapshotHeader } from "./core";
 import { EgressCtx, Egress, EgressFactory } from "./egress";
-import { ChunkShared, ChunkWriter, JournalConfig, createChunkShared, openJournal } from "./journal";
-import { CMD_SLOT, Control, EVT_SLOT, EvtView, evtArg, evtCtl, writeCmd, writeCtl } from "./msg";
+import {
+  ChunkShared, ChunkWriter, JournalConfig, checkpointPath, clearJournalDir, createChunkShared, openJournal, openSegment,
+  removeCheckpointsBelow, removeSegmentsBelow, writeDurably,
+} from "./journal";
+import { CMD_SLOT, Control, EVT_SLOT, EvtView, evtArg, evtCtl, evtIseq, writeCmd, writeCtl } from "./msg";
 import { PartitionMap } from "./routing";
 import { Consumer, Publish, RingShared, SingleProducer, WaitStrategy, backoff, busySpin, createRing, parkUs } from "./ring";
 import { EngineData, EngineInitial, FAIL_BYTES, IoData, RouterData, readFailure, recordFailure } from "./worker";
@@ -155,6 +158,7 @@ export class Pipeline {
   private nextOp = 0;
   private readonly snaps = new Map<number, { blocks: Block[]; remaining: number; cut: number }>();
   private readonly timer: NodeJS.Timeout;
+  private readonly journalCfg?: JournalConfig;
   private readonly pumpFn = () => this.pump();
 
   constructor(o: BuildOpts) {
@@ -173,6 +177,7 @@ export class Pipeline {
       throw new PipelineError("config", "ring sizes must be powers of two >= 2");
     const nextIseq = Math.max(o.initial?.nextIseq ?? 1, 1);
     const journaled = o.journal !== undefined;
+    this.journalCfg = o.journal;
     const startWm = BigInt(nextIseq - 1);
 
     // journals first, so I/O errors surface from build()
@@ -181,6 +186,7 @@ export class Pipeline {
       const jc = o.journal!;
       try {
         fs.mkdirSync(jc.dir, { recursive: true });
+        if (!jc.append) clearJournalDir(jc.dir, jc.format);
         for (let p = 0; p < P; p++) {
           const m = new SharedArrayBuffer(16);
           const marks = new BigInt64Array(m);
@@ -219,7 +225,7 @@ export class Pipeline {
       this.ports.push(ch.port1);
       const ed: EngineData = {
         ...common("engine", "engine"), role: "engine", partition: p, partitions: P, table, inbox, outbox, core: o.core,
-        book: o.book, journal: journaled ? { shared: cmdShared[p]!, format: o.journal!.format } : null,
+        book: o.book, journal: journaled ? { shared: cmdShared[p]!, format: o.journal!.format, dir: o.journal!.dir } : null,
         initial: o.initial === undefined ? null : { snapshot: o.initial.snapshot, journal: o.initial.journal },
         port: ch.port2, wait: o.waits.engine,
       };
@@ -258,6 +264,11 @@ export class Pipeline {
           part.epoch = evtArg(v, off);
         } else if (ctl === Control.Shutdown) {
           part.stopSeen = true;
+        } else if (ctl === Control.Checkpoint) {
+          const cut = evtIseq(v, off);
+          if (part.evtJournal !== undefined)
+            part.evtJournal.rotate(openSegment(o.journal!.dir, o.journal!.format, "evt", p, P, o.book, cut));
+          for (const pl of part.plugs) pl.onCheckpoint?.(cut);
         }
         if (eob) for (const pl of part.plugs) pl.onBatchEnd?.();
       };
@@ -393,9 +404,33 @@ export class Pipeline {
 
   /// A consistent snapshot of every book, cut at this point of the ingress order.
   snapshot(): Snapshot {
+    return this.snapshotOp(Control.Snapshot);
+  }
+
+  /// A checkpoint (spec/JOURNAL.md §6): a snapshot cut here; every journal
+  /// rotates onto a new segment at the cut; the snapshot is written durably
+  /// into the journal directory; older segments and checkpoints are removed.
+  checkpoint(): Snapshot {
+    const cfg = this.journalCfg;
+    if (cfg === undefined) throw new PipelineError("config", "checkpoint needs journals");
+    const s = this.snapshotOp(Control.Checkpoint);
+    this.drain(); // every egress has rotated its event journal
+    try {
+      const p = checkpointPath(cfg.dir, s.iseq);
+      writeDurably(p, s.body);
+      writeDurably(metaPath(p), s.meta());
+      removeSegmentsBelow(cfg.dir, cfg.format, s.iseq);
+      removeCheckpointsBelow(cfg.dir, s.iseq);
+    } catch (e) {
+      throw new PipelineError("io", (e as Error).message);
+    }
+    return s;
+  }
+
+  private snapshotOp(ctl: Control): Snapshot {
     const op = ++this.nextOp;
     this.snaps.set(op, { blocks: [], remaining: this.partitions, cut: 0 });
-    this.publishCtl(Control.Snapshot, op);
+    this.publishCtl(ctl, op);
     const st = this.snaps.get(op)!;
     this.waitUntil(() => {
       for (const port of this.ports) {

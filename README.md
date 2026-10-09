@@ -6,7 +6,7 @@ The TypeScript implementation of [orderer](https://github.com/abhijitkrm/orderer
 an LMAX-Disruptor-style, multi-core order-matching engine around the
 [matcher](https://github.com/abhijitkrm/matcher) order book, on Node.js
 `worker_threads` and `SharedArrayBuffer`. It needs Node 18+ and no runtime
-dependencies, and implements `orderer-spec/1.1`. It is a port of
+dependencies, and implements `orderer-spec/1.2`. It is a port of
 [orderer-rust](https://github.com/abhijitkrm/orderer-rust), and
 **byte-identical** to it: listings, per-partition journals (JSONL and
 binary), snapshots and exit codes.
@@ -54,7 +54,8 @@ The runnable version is `examples/quickstart.ts`.
 | Routing | `PartitionMap` | hash (spec/ROUTING.md) + table overrides |
 | Journals | `JournalConfig`, `FsyncPolicy` | JSONL or binary, group-commit fsync on I/O workers |
 | Waiting | `Waits` / `WaitStrategy` | busySpin, yield, backoff, blocking (`Atomics.wait`) |
-| Recovery | `recover`, `readSnapshot`, `restore` | snapshot + journals → cores at any P; `Recovery.initial()` resumes a pipeline |
+| Recovery | `recover`, `readSnapshot`, `restore`, `repairDir` | snapshot + journals → cores at any P; `Recovery.initial()` resumes a pipeline; torn tails repaired |
+| Checkpoints | `Pipeline.checkpoint()` | durable snapshot + journal segment rotation; old segments removed |
 
 ## Limits
 
@@ -68,7 +69,7 @@ The runnable version is `examples/quickstart.ts`.
 
 ```bash
 npm install && npm run build
-scripts/test.sh                     # ring, golden, pipeline suites + vectors through the harness tools
+scripts/test.sh                     # ring, golden, pipeline suites + the vendored spec/conformance.sh
 scripts/build-harness.sh            # → harness/bin/{orderrun,ordererfuzz,orderrecover,ordersnap,orderbench}
 scripts/vendored.sh                 # vendored spec/ + vectors/ untouched
 ```

@@ -22,6 +22,7 @@ export interface Egress {
   onBatchEnd?(): void; // after a ring batch / before a drain completes
   onIdle?(): void; // while idle: release gated work
   onShutdown?(): void; // once, after every event
+  onCheckpoint?(cut: number): void; // a checkpoint cut passed (1.2)
 }
 
 export type EgressFactory = (ctx: EgressCtx) => Egress;

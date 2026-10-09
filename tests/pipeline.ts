@@ -7,7 +7,11 @@ import { Side, Tif, cancel, eventCanonical, newLimit } from "../src/matcher/type
 import { EvtMsg } from "../src/msg";
 import { acks, collect, Egress } from "../src/egress";
 import { u64 } from "../src/flat";
-import { CMD_RECORD, CorruptJournal, JournalConfig, JournalFormat, fsyncEvery, fsyncEveryN, journalConfig, journalPath, readCmdDir, readEvtJournal } from "../src/journal";
+import {
+  CMD_RECORD, CMD_RECORD_V1, CorruptJournal, HEADER, JournalConfig, JournalFormat, crc32c, fsyncEvery, fsyncEveryN, journalConfig,
+  journalPath, listCheckpoints, listSegments, readCmdDir, readEvtJournal, readEvtPartition, repairDir,
+} from "../src/journal";
+import { readSnapshot } from "../src/recover";
 import { Pipeline, PipelineError, Snapshot, Status } from "../src/pipeline";
 import { recover } from "../src/recover";
 import { CORES } from "../src/core";
@@ -158,6 +162,8 @@ function tornAndCorruptJournalsAreErrors(): void {
       back = Buffer.from(good);
       back.fill(0, back.length - CMD_RECORD, back.length - CMD_RECORD + 8);
       back[back.length - CMD_RECORD] = 1;
+      // a well-formed (resealed) record, just out of order
+      back.writeUInt32LE(crc32c(back, back.length - CMD_RECORD, CMD_RECORD_V1), back.length - CMD_RECORD + CMD_RECORD_V1);
     } else {
       back = Buffer.concat([good, Buffer.from('{"cmd":"cancel","symbol":0,"order_id":1,"iseq":3}\n')]);
     }
@@ -314,6 +320,107 @@ function failingEgressFailsThePipeline(): void {
   }
 }
 
+// ---- 1.2: checksums, repair, checkpoints -----------------------------------------------------
+
+function crc32cMatchesTheSpecCheckValue(): void {
+  check(crc32c(Buffer.from("123456789")) === 0xe3069283, "check value");
+}
+
+function checksumsCatchFlippedBitsAnywhere(): void {
+  const dir = scratch("crc");
+  const p = Pipeline.builder().bookConfig(CFG).journal(jcfg(dir, "binary")).build();
+  p.publishBatch(fuzzCorpus(9, 300, 2));
+  p.shutdown();
+  const pth = journalPath(dir, "cmd", 0, "binary");
+  const bad = fs.readFileSync(pth);
+  bad[HEADER + 100 * CMD_RECORD + 20] ^= 0x10;
+  fs.writeFileSync(pth, bad);
+  let threw = false;
+  try { readCmdDir(dir, "binary"); } catch (e) { threw = (e as Error).message.includes("checksum"); }
+  check(threw, "strict");
+  threw = false;
+  try { repairDir(dir, "binary"); } catch { threw = true; }
+  check(threw, "mid-file damage is not repairable");
+}
+
+function repairCutsOnlyATornTail(): void {
+  const cmds = fuzzCorpus(10, 400, 3);
+  for (const fmt of ["jsonl", "binary"] as JournalFormat[]) {
+    const dir = scratch(`repair-${fmt}`);
+    const p = Pipeline.builder().bookConfig(CFG).journal(jcfg(dir, fmt)).build();
+    p.publishBatch(cmds);
+    p.shutdown();
+    const pth = journalPath(dir, "cmd", 0, fmt);
+    const good = fs.readFileSync(pth);
+    const full = readCmdDir(dir, fmt).partitions[0];
+    fs.writeFileSync(pth, good.subarray(0, good.length - 5));
+    let threw = false;
+    try { readCmdDir(dir, fmt); } catch { threw = true; }
+    check(threw, "strict rejects a torn tail");
+    check(repairDir(dir, fmt).length === 1);
+    check(eq(readCmdDir(dir, fmt).partitions[0], full.slice(0, -1)), "a prefix survives");
+    if (fmt === "binary") {
+      const zeroed = Buffer.from(good);
+      zeroed.fill(0, zeroed.length - CMD_RECORD);
+      fs.writeFileSync(pth, zeroed);
+      check(repairDir(dir, fmt).length === 1, "a complete record that never reached the disk");
+      check(readCmdDir(dir, fmt).partitions[0].length === full.length - 1);
+    }
+    check(repairDir(dir, fmt).length === 0, "a clean file is left alone");
+  }
+}
+
+function checkpointsRotateSegmentsAndBoundRecovery(): void {
+  const cmds = fuzzCorpus(12, 3000, 6);
+  for (const fmt of ["jsonl", "binary"] as JournalFormat[]) {
+    const dir = scratch(`ckpt-${fmt}`);
+    const [f, h] = collect(true);
+    const p = Pipeline.builder().bookConfig(CFG).partitions(3).journal(jcfg(dir, fmt)).egress(f).build();
+    p.publishBatch(cmds, 0, 1000);
+    const c1 = p.checkpoint();
+    p.publishBatch(cmds, 1000, 2200);
+    const c2 = p.checkpoint();
+    p.publishBatch(cmds, 2200);
+    p.shutdown();
+    check(c1.iseq === 1000 && c2.iseq === 2200, `cuts ${c1.iseq} ${c2.iseq}`);
+    const cps = listCheckpoints(dir);
+    check(cps.length === 1 && cps[0].cut === 2200, "only the last checkpoint remains");
+    for (const k of ["cmd", "evt"] as const) {
+      const segs = listSegments(dir, k, fmt);
+      check(segs.length === 3 && segs.every((s) => s.start === 2200), `${k} segments`);
+    }
+    check(c2.body === referenceSnapshot(CFG, cmds, 2200), "checkpoint body");
+    const replayed: string[] = [];
+    const rec = recover(CORES.fifo, CFG, PartitionMap.make(3), readSnapshot(cps[0].path), { dir, format: fmt },
+      (_q, s, seq, e) => replayed.push(eventCanonical(seq, e, s)));
+    const all = referenceLines(CFG, cmds), prefix = referenceLines(CFG, cmds.slice(0, 2200)).length;
+    check(rec.replayed === cmds.length - 2200 && eq(replayed, all.slice(prefix)), "recover from the checkpoint");
+    const evts = [0, 1, 2].flatMap((q) => readEvtPartition(dir, fmt, q)).sort();
+    check(eq(evts, all.slice(prefix).sort()), "event segments hold the tail");
+    check(lines(h.listing()).length === all.length);
+  }
+}
+
+function appendContinuesTheLastSegmentAfterACheckpoint(): void {
+  const cmds = fuzzCorpus(14, 2000, 4);
+  const dir = scratch("ckpt-append");
+  const j = jcfg(dir, "binary");
+  let p = Pipeline.builder().bookConfig(CFG).partitions(2).journal(j).build();
+  p.publishBatch(cmds, 0, 800);
+  p.checkpoint();
+  p.publishBatch(cmds, 800, 1200);
+  p.shutdown();
+  const m = PartitionMap.make(2);
+  const rec = recover(CORES.fifo, CFG, m, readSnapshot(listCheckpoints(dir)[0].path), { dir, format: "binary" }, () => {});
+  check(rec.lastIseq === 1200);
+  p = Pipeline.builder().bookConfig(rec.book).partitionMap(m).journal({ ...j, append: true }).initial(rec.initial()).build();
+  p.publishBatch(cmds, 1200);
+  const s = p.snapshot();
+  p.shutdown();
+  check(s.iseq === 2000 && s.body === referenceSnapshot(CFG, cmds, 2000), "resumed state");
+  check(readCmdDir(dir, "binary").partitions.flat().length === 1200, "800 checkpointed away");
+}
+
 const tests: Array<[string, () => void]> = [
   ["every_partition_count_matches_reference_per_symbol", everyPartitionCountMatchesReference],
   ["fuzz_runs_are_deterministic_per_partition", fuzzRunsAreDeterministic],
@@ -331,5 +438,10 @@ const tests: Array<[string, () => void]> = [
   ["noop_core_sees_every_command", noopCoreSeesEveryCommand],
   ["failing_core_fails_the_pipeline_instead_of_hanging", failingCoreFailsThePipelineInsteadOfHanging],
   ["failing_egress_fails_the_pipeline", failingEgressFailsThePipeline],
+  ["crc32c_matches_the_spec_check_value", crc32cMatchesTheSpecCheckValue],
+  ["checksums_catch_flipped_bits_anywhere", checksumsCatchFlippedBitsAnywhere],
+  ["repair_cuts_only_a_torn_tail", repairCutsOnlyATornTail],
+  ["checkpoints_rotate_segments_and_bound_recovery", checkpointsRotateSegmentsAndBoundRecovery],
+  ["append_continues_the_last_segment_after_a_checkpoint", appendContinuesTheLastSegmentAfterACheckpoint],
 ];
 runAll(tests);

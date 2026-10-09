@@ -13,7 +13,7 @@ import { MessagePort, isMainThread, workerData } from "worker_threads";
 import { BookConfig } from "./matcher/book";
 import { Command, Event } from "./matcher/types";
 import { Block, MatchingCore, parseSnapshot, resolveCore } from "./core";
-import { ChunkShared, ChunkWriter, JournalFormat, ioLoop, mergeJournals, readCmdDir } from "./journal";
+import { ChunkShared, ChunkWriter, JournalFormat, ioLoop, mergeJournals, openSegment, readCmdDir } from "./journal";
 import { Control, cmdArg, cmdCtl, cmdIseq, cmdSym, cmdTPub, copyCmd, readCmd, setCmdIseq, writeEvt, writeEvtCtl } from "./msg";
 import { PartitionMap } from "./routing";
 import { Consumer, RingShared, SingleProducer, WaitStrategy } from "./ring";
@@ -74,7 +74,7 @@ export interface EngineData extends Common {
   outbox: RingShared;
   core: string;
   book: BookConfig;
-  journal: { shared: ChunkShared; format: JournalFormat } | null;
+  journal: { shared: ChunkShared; format: JournalFormat; dir: string } | null;
   initial: EngineInitial | null;
   port: MessagePort; // snapshot replies
   wait: WaitStrategy;
@@ -167,7 +167,10 @@ function engine(d: EngineData): void {
       core.apply(sym, cmd, emit);
     } else {
       const cut = cmdIseq(v, o), arg = cmdArg(v, o);
-      if (ctl === Control.Snapshot) {
+      // the new segment starts at this cut, before the snapshot is reported
+      if (ctl === Control.Checkpoint && journal !== null && d.journal !== null)
+        journal.rotate(openSegment(d.journal.dir, d.journal.format, "cmd", d.partition, d.partitions, d.book, cut));
+      if (ctl === Control.Snapshot || ctl === Control.Checkpoint) {
         const blocks: Block[] = [];
         core.snapshotBlocks(blocks);
         d.port.postMessage({ op: arg, cut, blocks });

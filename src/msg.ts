@@ -10,6 +10,7 @@ export enum Control {
   Barrier,
   Snapshot,
   Shutdown,
+  Checkpoint,
 }
 
 // ---- CmdMsg: ingress / inbox slot (64 bytes) ----------------------------------------------
