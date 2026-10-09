@@ -40,6 +40,12 @@ export function runAll(tests: Array<[string, () => void]>): void {
   process.exitCode = failures === 0 ? 0 : 1;
 }
 
+/// After async tests: report and set the exit code again.
+export function finish(): void {
+  console.log(`after async tests: ${checks} checks, ${failures} failures`);
+  process.exitCode = failures === 0 ? 0 : 1;
+}
+
 export const slurp = (p: string) => fs.readFileSync(p, "utf8");
 export const lines = (s: string) => (s === "" ? [] : s.replace(/\n$/, "").split("\n"));
 export type Cmds = Array<[number, Command]>;

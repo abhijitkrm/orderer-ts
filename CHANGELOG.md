@@ -7,6 +7,8 @@
 - `Pipeline.checkpoint()` rotates journals onto segments at a clean cut (the
   I/O worker switches files on a ROTATE marker), writes the snapshot durably
   and removes covered segments.
+- `Builder.checkpointEvery(ms)`: automatic checkpoints from the owner's
+  event loop while it is idle.
 - `orderrun --checkpoint-every K` and `--durable`; `scripts/test.sh` runs the
   vendored `spec/conformance.sh`.
 - Publishing from any thread: multi-producer ingress, `Handle` /

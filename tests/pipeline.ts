@@ -17,7 +17,7 @@ import { Pipeline, PipelineError, Snapshot, Status } from "../src/pipeline";
 import { recover } from "../src/recover";
 import { CORES } from "../src/core";
 import { PartitionMap, hashPartition } from "../src/routing";
-import { bySymbol, check, concat, dense, eq, fuzzCfg, fuzzCorpus, lines, referenceLines, referenceSnapshot, runAll, runPipeline, scratch, sleepMs } from "./t";
+import { bySymbol, check, finish, concat, dense, eq, fuzzCfg, fuzzCorpus, lines, referenceLines, referenceSnapshot, runAll, runPipeline, scratch, sleepMs } from "./t";
 
 const CFG = fuzzCfg();
 
@@ -464,6 +464,30 @@ function everyOkPublishRacingShutdownIsApplied(): void {
   }
 }
 
+/// Automatic checkpoints need an idle event loop, so this test is async.
+async function automaticCheckpointsKeepTheDirectoryRecoverable(): Promise<void> {
+  const cmds = fuzzCorpus(15, 20000, 8);
+  const dir = scratch("ckpt-auto");
+  const p = Pipeline.builder().bookConfig(CFG).partitions(3).journal(jcfg(dir, "binary")).checkpointEvery(20).build();
+  for (let i = 0; i < cmds.length; i += 500) {
+    p.publishBatch(cmds, i, Math.min(i + 500, cmds.length));
+    await new Promise((r) => setTimeout(r, 3));
+  }
+  const last = p.snapshot();
+  p.shutdown();
+  const cps = listCheckpoints(dir);
+  check(cps.length === 1 && cps[0].cut > 0, `one automatic checkpoint remains: ${JSON.stringify(cps)}`);
+  const m = PartitionMap.make(3);
+  const rec = recover(CORES.fifo, CFG, m, readSnapshot(cps[0].path), { dir, format: "binary" }, () => {});
+  check(rec.lastIseq === cmds.length);
+  const p2 = Pipeline.builder().bookConfig(rec.book).partitionMap(m).initial(rec.initial()).build();
+  check(p2.snapshot().body === last.body, "the directory recovers the final state");
+  p2.shutdown();
+  let threw = false;
+  try { Pipeline.builder().checkpointEvery(5).build(); } catch (e) { threw = e instanceof PipelineError && e.kind === "config"; }
+  check(threw, "needs journals");
+}
+
 const tests: Array<[string, () => void]> = [
   ["every_partition_count_matches_reference_per_symbol", everyPartitionCountMatchesReference],
   ["fuzz_runs_are_deterministic_per_partition", fuzzRunsAreDeterministic],
@@ -490,3 +514,14 @@ const tests: Array<[string, () => void]> = [
   ["append_continues_the_last_segment_after_a_checkpoint", appendContinuesTheLastSegmentAfterACheckpoint],
 ];
 runAll(tests);
+// async tests run after the synchronous suite
+void (async () => {
+  const t0 = performance.now();
+  try {
+    await automaticCheckpointsKeepTheDirectoryRecoverable();
+    console.log(`ok   automatic_checkpoints_keep_the_directory_recoverable (${Math.round(performance.now() - t0)} ms)`);
+  } catch (e) {
+    check(false, `automatic checkpoints threw ${(e as Error).stack}`);
+  }
+  finish();
+})();

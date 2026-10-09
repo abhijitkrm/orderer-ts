@@ -79,6 +79,7 @@ export class Builder {
   private stamps = false;
   private init?: Initial;
   private coreSpec = "fifo";
+  private ckptMs = 0;
 
   /// "fifo" (matcher-ts OrderBook per symbol), "noop", or "module#export" of a CoreFactory.
   core(spec: string): this { this.coreSpec = spec; return this; }
@@ -91,10 +92,15 @@ export class Builder {
   egress(f: EgressFactory): this { this.egressFactories.push(f); return this; }
   timestamps(on: boolean): this { this.stamps = on; return this; }
   initial(i: Initial): this { this.init = i; return this; }
+  /// Take a checkpoint (spec/JOURNAL.md §6) every `ms` from the owner's event
+  /// loop: they run while the owner is idle (between your calls), never
+  /// inside one. Needs journals; a failed checkpoint fails the pipeline.
+  checkpointEvery(ms: number): this { this.ckptMs = ms; return this; }
   build(): Pipeline {
     return new Pipeline({
       book: this.book, map: this.map, parts: this.parts, rings: this.rings, waits: this.waitsCfg, journal: this.journalCfg,
       egress: this.egressFactories, timestamps: this.stamps, initial: this.init, core: this.coreSpec,
+      checkpointMs: this.ckptMs,
     });
   }
 }
@@ -110,6 +116,7 @@ interface BuildOpts {
   timestamps: boolean;
   initial?: Initial;
   core: string;
+  checkpointMs: number;
 }
 
 interface EgressPart {
@@ -158,6 +165,8 @@ export class Pipeline {
   private readonly snaps = new Map<number, { blocks: Block[]; remaining: number; cut: number }>();
   private readonly timer: NodeJS.Timeout;
   private readonly journalCfg?: JournalConfig;
+  private readonly ckptMs: number;
+  private lastCkpt = performance.now();
   private readonly pumpFn = () => this.pump();
 
   constructor(o: BuildOpts) {
@@ -177,6 +186,8 @@ export class Pipeline {
     const nextIseq = Math.max(o.initial?.nextIseq ?? 1, 1);
     const journaled = o.journal !== undefined;
     this.journalCfg = o.journal;
+    if (o.checkpointMs > 0 && !journaled) throw new PipelineError("config", "checkpointEvery needs journals");
+    this.ckptMs = o.checkpointMs;
     const startWm = BigInt(nextIseq - 1);
 
     // journals first, so I/O errors surface from build()
@@ -281,7 +292,7 @@ export class Pipeline {
     this.ingressShared = ingress;
     this.ingress = new MultiProducer(ingress);
     this.owner = new Handle(this.handleDescriptor(), this.pumpFn);
-    this.timer = setInterval(this.pumpFn, 1);
+    this.timer = setInterval(() => this.idleTick(), 1);
     this.timer.unref();
   }
 
@@ -333,6 +344,20 @@ export class Pipeline {
   private check(): void {
     const f = this.failure();
     if (f !== undefined) throw new PipelineError("failed", `pipeline failed: ${f}`);
+  }
+
+  /// The owner's idle timer: pump, and checkpoint when one is due.
+  private idleTick(): void {
+    this.pump();
+    if (this.ckptMs > 0 && !this.closed && performance.now() - this.lastCkpt >= this.ckptMs) {
+      this.lastCkpt = performance.now();
+      try {
+        this.checkpoint();
+      } catch (e) {
+        if (!(e instanceof PipelineError && (e.kind === "closed" || e.kind === "failed")))
+          recordFailure(this.fail, this.alert, `checkpoint: ${(e as Error).message}`);
+      }
+    }
   }
 
   /// Run the egress plugs over everything the outboxes hold; events handled.
