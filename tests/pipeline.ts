@@ -495,7 +495,7 @@ function statsCountCommandsEventsAndFsyncs(): void {
   p.publishBatch(cmds);
   p.drain();
   const deadline = performance.now() + 10_000;
-  while (p.stats().partitions.some((s) => s.durableIseq < s.flushedIseq) && performance.now() < deadline) {
+  while (p.stats().partitions.some((s) => s.fsyncs === 0 || s.durableIseq < s.flushedIseq) && performance.now() < deadline) {
     p.pump();
     sleepMs(5);
   }
