@@ -345,6 +345,11 @@ interface Body {
   validLen: number; // bytes a repair keeps
 }
 
+function allZero(b: Buffer, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) if (b[i] !== 0) return false;
+  return true;
+}
+
 function splitBody(p: string, b: Buffer, f: JournalFormat, mode: ReadMode): Body {
   if (f === "binary") {
     const header = parseBinaryHeader(p, b);
@@ -352,6 +357,10 @@ function splitBody(p: string, b: Buffer, f: JournalFormat, mode: ReadMode): Body
     let n = Math.floor(body / size);
     if (body % size !== 0 && mode === "strict") throw corrupt(p, "torn tail (partial record)");
     const v = new DataView(b.buffer, b.byteOffset, b.length);
+    if (mode === "repair") {
+      // 1.3: zero records an interrupted write left (§5.1)
+      while (n > 0 && allZero(b, HEADER + (n - 1) * size, HEADER + n * size)) n--;
+    }
     if (header.version >= 2) {
       for (let i = 0; i < n; i++) {
         if (!sealed(v, HEADER + i * size, payloadOf(header.kind))) {
@@ -458,24 +467,70 @@ export function readEvtPartition(dir: string, f: JournalFormat, p: number): stri
 export function repairDir(dir: string, f: JournalFormat): Array<{ path: string; bytes: number }> {
   const out: Array<{ path: string; bytes: number }> = [];
   for (const k of ["cmd", "evt"] as JournalKind[]) {
-    const last = new Map<number, string>();
-    for (const s of listSegments(dir, k, f)) last.set(s.partition, s.path);
-    for (const p of last.values()) {
-      const b = readFile(p);
-      const body = splitBody(p, b, f, "repair");
-      if (body.validLen < b.length) {
-        const fd = fs.openSync(p, "r+");
+    const parts = new Map<number, Segment[]>();
+    for (const s of listSegments(dir, k, f)) {
+      const l = parts.get(s.partition);
+      if (l) l.push(s);
+      else parts.set(s.partition, [s]);
+    }
+    for (const segs of parts.values()) {
+      segs.sort((a, b) => a.start - b.start);
+      // 1.3: drop trailing segments a crash left without a usable header;
+      // the segment before becomes the last
+      while (segs.length > 0 && segs[segs.length - 1].start > 0) {
+        const p = segs[segs.length - 1].path;
+        const b = readFile(p);
+        if (!headerless(p, b, f)) break;
+        fs.unlinkSync(p);
         try {
-          fs.ftruncateSync(fd, body.validLen);
-          fs.fsyncSync(fd);
-        } finally {
-          fs.closeSync(fd);
+          const d = fs.openSync(dir, "r");
+          try {
+            fs.fsyncSync(d);
+          } finally {
+            fs.closeSync(d);
+          }
+        } catch {
+          // some platforms cannot sync a directory
         }
-        out.push({ path: p, bytes: b.length - body.validLen });
+        out.push({ path: p, bytes: b.length });
+        segs.pop();
+      }
+      // repair the last segment; while it holds no records, the one before
+      // it too (its writer may still have been finishing it)
+      for (let i = segs.length - 1; i >= 0; i--) {
+        const p = segs[i].path;
+        const b = readFile(p);
+        const body = splitBody(p, b, f, "repair");
+        if (body.validLen < b.length) {
+          const fd = fs.openSync(p, "r+");
+          try {
+            fs.ftruncateSync(fd, body.validLen);
+            fs.fsyncSync(fd);
+          } finally {
+            fs.closeSync(fd);
+          }
+          out.push({ path: p, bytes: b.length - body.validLen });
+        }
+        if (body.records.length > 0) break;
       }
     }
   }
   return out;
+}
+
+/// A segment that cannot hold a record (spec/JOURNAL.md 1.3 §5.1): JSONL with
+/// no newline at all, or binary with an invalid header and nothing but zeros
+/// after it.
+function headerless(p: string, b: Buffer, f: JournalFormat): boolean {
+  if (f === "jsonl") return b.indexOf(10) < 0;
+  if (!allZero(b, Math.min(HEADER, b.length), b.length)) return false;
+  try {
+    parseBinaryHeader(p, b);
+    return false;
+  } catch (e) {
+    if (e instanceof CorruptJournal) return true;
+    throw e;
+  }
 }
 
 /// One iseq-ordered stream of records after `after`; iseqs must be disjoint.
