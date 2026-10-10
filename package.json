@@ -1,6 +1,6 @@
 {
   "name": "@abhijitkrm/orderer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "LMAX-Disruptor-style multi-core order-matching pipeline (worker_threads + SharedArrayBuffer) around matcher-ts",
   "license": "(MIT OR Apache-2.0)",
   "repository": { "type": "git", "url": "git+https://github.com/abhijitkrm/orderer-ts.git" },

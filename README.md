@@ -6,7 +6,7 @@ The TypeScript implementation of [orderer](https://github.com/abhijitkrm/orderer
 an LMAX-Disruptor-style, multi-core order-matching engine around the
 [matcher](https://github.com/abhijitkrm/matcher) order book, on Node.js
 `worker_threads` and `SharedArrayBuffer`. It needs Node 18+ and no runtime
-dependencies, and implements `orderer-spec/1.2`. It is a port of
+dependencies, and implements `orderer-spec/1.3`. It is a port of
 [orderer-rust](https://github.com/abhijitkrm/orderer-rust), and
 **byte-identical** to it: listings, per-partition journals (JSONL and
 binary), snapshots and exit codes.
@@ -28,10 +28,10 @@ synchronous.
 ## Install
 
 ```bash
-npm install github:abhijitkrm/orderer-ts#v0.2.0
+npm install github:abhijitkrm/orderer-ts#v0.2.1
 ```
 
-The package (`@abhijitkrm/orderer@0.2.0`) is ready for npm (`npm pack`
+The package (`@abhijitkrm/orderer@0.2.1`) is ready for npm (`npm pack`
 passes) but not yet published.
 
 ## Quick start
