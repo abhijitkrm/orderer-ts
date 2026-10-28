@@ -83,6 +83,8 @@ interface PipeOpts {
   waits: Waits;
   core: string;
   rings: [number, number, number];
+  /** stamp commands and sample end-to-end latency (the BENCH.md protocol) */
+  latency: boolean;
 }
 
 function build(o: PipeOpts, book: Corpus["book"], m?: ReturnType<typeof metrics>[0]): Pipeline {
@@ -105,7 +107,7 @@ function pipeMode(setup: Corpus, run: Corpus, o: PipeOpts, warmups: number): Row
   p.publishBatch(setup.cmds);
   p.drain();
   gc();
-  p.setTimestamps(true);
+  p.setTimestamps(o.latency);
   let wall: number;
   if (o.producers <= 1) {
     wall = performance.now();
@@ -149,9 +151,9 @@ function cpu(): string {
 
 const usage = "orderbench <prefix> --mode core|pipe [--partitions P] [--producers N] [--journal binary|jsonl|off] " +
   "[--journal-dir DIR] [--fsync N] [--tag NAME] [--core fifo|noop] [--waits relaxed|low] [--batch N] " +
-  "[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--warmups N]";
+  "[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--latency on|off] [--warmups N]";
 const a = new Args(process.argv.slice(2), usage, ["--mode", "--partitions", "--producers", "--journal", "--journal-dir",
-  "--fsync", "--tag", "--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--baseline", "--warmups"], []);
+  "--fsync", "--tag", "--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--baseline", "--warmups", "--latency"], []);
 if (a.positional.length !== 1) die(usage);
 const prefix = a.positional[0];
 const tag = a.get("--tag") ?? path.basename(prefix);
@@ -170,7 +172,11 @@ if (mode === "core") {
     partitions: a.num("--partitions", 1, 1024), batch: Math.max(a.num("--batch", 64, 1 << 20), 1),
     waits: lowLatencyWaits(), core: a.get("--core") ?? "fifo",
     rings: [a.num("--ingress", 1 << 14, 1 << 30), a.num("--inbox", 1 << 12, 1 << 30), a.num("--outbox", 1 << 13, 1 << 30)],
+    latency: true,
   };
+  const lat = a.get("--latency") ?? "on";
+  if (lat === "off") o.latency = false;
+  else if (lat !== "on") die(`--latency: unknown ${lat}`);
   const fsync = a.num("--fsync", 1024, Number.MAX_SAFE_INTEGER);
   const jm = a.get("--journal") ?? "binary";
   const tmp = path.join(os.tmpdir(), `orderbench-ts-${process.pid}`);
@@ -185,7 +191,7 @@ if (mode === "core") {
   else if (w !== "low") die(`--waits: unknown ${w}`);
   if (o.core !== "fifo" && o.core !== "noop") die(`--core: unknown ${o.core}`);
   config.push(`journal=${jm} fsync=${fsync}`);
-  for (const k of ["--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--warmups"])
+  for (const k of ["--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--warmups", "--latency"])
     if (a.get(k) !== undefined) config.push(`${k.slice(2)}=${a.get(k)}`);
   try {
     row = pipeMode(setup, run, o, warmups);
