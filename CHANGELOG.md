@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `src/consensus.ts`: the replication protocol core (`spec/REPLICATION.md`) as a pure state machine, ported from orderer-rust and proved against the shared conformance vectors (`vectors/replication/`: 28 traces, 28,000 recorded drain points, byte-identical effects and state; the 64-bit generator uses BigInt). Only the protocol core is ported; the WAL, transport and replica runtime are not.
+
 - `orderbench --latency on|off`. `off` stops stamping and sampling commands, which
   the BENCH.md protocol does with two clock reads per command; default `on`.
   Journals-off pipeline, M1: P=2 no-op core 8.9M -> 14.7M, real core P=3
