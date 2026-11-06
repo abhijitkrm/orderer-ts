@@ -10,3 +10,4 @@ export * from "./recover";
 export * as matcher from "./matcher/index";
 export * from "./handle";
 export * from "./stats";
+export * as cluster from "./cluster/index";

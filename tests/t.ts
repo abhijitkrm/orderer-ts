@@ -40,6 +40,24 @@ export function runAll(tests: Array<[string, () => void]>): void {
   process.exitCode = failures === 0 ? 0 : 1;
 }
 
+/// Run async tests one after another, with the same reporting as runAll.
+export async function runAllAsync(tests: Array<[string, () => Promise<void>]>): Promise<void> {
+  const t0 = performance.now();
+  for (const [name, body] of tests) {
+    current = name;
+    const before = failures, s = performance.now();
+    try {
+      await body();
+    } catch (e) {
+      failures++;
+      console.log(`  FAIL [${name}] threw ${(e as Error).stack ?? e}`);
+    }
+    console.log(`${failures === before ? "ok  " : "FAIL"} ${name} (${Math.round(performance.now() - s)} ms)`);
+  }
+  console.log(`${tests.length} tests, ${checks} checks, ${failures} failures (${Math.round(performance.now() - t0)} ms)`);
+  process.exitCode = failures === 0 ? 0 : 1;
+}
+
 /// After async tests: report and set the exit code again.
 export function finish(): void {
   console.log(`after async tests: ${checks} checks, ${failures} failures`);

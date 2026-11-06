@@ -152,7 +152,7 @@ export class Node {
     return o;
   }
 
-  private entryAt(i: Index): Entry | undefined {
+  entryAt(i: Index): Entry | undefined {
     return i > this.base_ && i - this.base_ - 1 < this.log.length ? this.log[i - this.base_ - 1] : undefined;
   }
 

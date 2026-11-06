@@ -66,6 +66,24 @@ The runnable version is `examples/quickstart.ts`.
 | Recovery | `recover`, `readSnapshot`, `restore`, `repairDir` | snapshot + journals → cores at any P; `Recovery.initial()` resumes a pipeline; torn tails repaired |
 | Checkpoints | `Pipeline.checkpoint()` | durable snapshot + journal segment rotation; old segments removed |
 
+## Replication
+
+`src/consensus.ts` is the replication protocol core (a pure state machine) and
+`src/cluster/` the runtime around it: write-ahead log, snapshots, TCP
+transport with optional pre-shared-key authentication, a replica that drives
+the pipeline as a replicated state machine, and a leader-following client with
+exactly-once sessions and linearizable `barrier()`. `tools/orderernode.ts`
+runs one replica as a process with the same command line and protocol as
+orderer-rust's `orderer-node`, orderer-cpp's `orderer_node` and orderer-go's
+`orderernode`: replicas of all four languages share one cluster
+(`scripts/interop.sh`), WAL and snapshot files are byte-identical, and state
+digests agree. `ShardMap` / `ShardedClient` scale out over independent groups;
+`tools/orderload.ts` is the load generator and failover verifier (`run`,
+`status`, `settle`, `verify`); `tools/clusterbench.ts` measures throughput
+(flags in its header).
+Design, proofs and numbers: `spec/REPLICATION.md` §13; TypeScript specifics
+in `docs/DESIGN.md`.
+
 ## Limits
 
 - Any thread can publish: `pipeline.handleDescriptor()` goes to a worker
@@ -75,13 +93,23 @@ The runnable version is `examples/quickstart.ts`.
   while workers publish. Measured: extra producers do not raise throughput,
   because the owner's egress pump, not publishing, is the bottleneck.
 - matcher-ts holds ids, prices and quantities as JS numbers. Values beyond
-  ±2^53 are rejected as malformed input rather than rounded.
+  ±2^53 are rejected as malformed input rather than rounded. In a replicated
+  cluster that means a TypeScript replica rejects (identically on every TS
+  replica, so no divergence among them) a command another language would
+  accept, and halts on the resulting digest mismatch if the cluster mixes
+  languages: keep order ids below 2^53 (`orderload` does; the Rust and Go load
+  tools use wider ids and cannot drive a TypeScript replica).
+- matcher-ts's default book (`priceMax` 1,000,000) costs about 90 MB per
+  symbol per replica. Replicas that must agree with other languages have to use
+  that default (the snapshot header carries the config); a TypeScript-only
+  cluster serving many symbols should narrow it.
 
 ## Build, test, harness
 
 ```bash
 npm install && npm run build
-scripts/test.sh                     # ring, golden, pipeline suites + the vendored spec/conformance.sh
+scripts/test.sh                     # ring, golden, pipeline, replication and cluster suites + the vendored spec/conformance.sh
+scripts/interop.sh                  # mixed Rust/C++/Go/TS clusters under kill -9 (needs the sibling repos built)
 scripts/build-harness.sh            # → harness/bin/{orderrun,ordererfuzz,orderrecover,ordersnap,orderbench}
 scripts/vendored.sh                 # vendored spec/ + vectors/ untouched
 ```

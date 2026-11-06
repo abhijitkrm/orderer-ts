@@ -70,3 +70,36 @@ full, in `drain`, `snapshot` and `shutdown`, and on an unref'd 1 ms timer
 when the event loop is idle (so `acks` keep flowing). Decoding events into
 objects for the plugs is the integrated pipeline's bottleneck; engines
 spend most of their time waiting on the owner.
+
+## The replica runtime (`src/cluster/`)
+
+The threaded runtimes give a replica a driver, a WAL thread and an applier
+thread. TypeScript has one event loop per worker, so a replica is one
+event-driven object on one thread, with three adaptations:
+
+- **WAL.** Persist effects queue; a batch is written with a synchronous
+  `writeSync` and fsynced with the asynchronous `fs.fsync`, which runs on
+  libuv's pool. Everything queued while one fsync is in flight goes in the
+  next: group commit, as the WAL thread gives the others. Entries are acked
+  only after the fsync callback calls `node.persisted`. (Compaction rewrites
+  the file synchronously, between fsyncs.)
+- **Applying.** Committed entries queue for the state machine and run in
+  2 ms slices between I/O polls (`setImmediate`), so a backlog cannot starve
+  heartbeats. `StateMachine.apply` may return `false` ("call me again with
+  this entry"); `PipelineSm` uses it with the non-blocking `tryPublish`, so a
+  full ingress ring (engines busy creating a symbol's first book, which takes
+  ~125 ms with the default ladder) never blocks the loop. Without it a
+  blocking `publishBatch` held the loop for seconds and the cluster lost its
+  leader. What the slicing cannot do is interrupt one `apply` call that itself
+  runs longer than the election timeout; and a snapshot or digest
+  (`drain` + `snapshot`) runs to completion on the loop.
+- **One replica per worker thread** when throughput matters. Several replicas
+  in one process (the tests) share a loop; `clusterbench` gives each replica
+  its own worker thread, and the leader's worker also runs the producers.
+
+Framing is incremental (`FrameReader` accumulates socket chunks, verifies the
+checksum and MAC, and hands whole frames up); sends are dropped when a socket's
+write buffer passes 32 MB, as the other runtimes drop on a full queue; a
+snapshot streams in 1 MiB chunks with drain-based back-pressure while other
+frames to that peer wait behind it. CRC-32C is slicing-by-8 in JS: Node's
+`zlib.crc32` is the other polynomial.
