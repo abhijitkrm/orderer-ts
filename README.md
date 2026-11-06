@@ -81,7 +81,7 @@ digests agree. `ShardMap` / `ShardedClient` scale out over independent groups;
 `tools/orderload.ts` is the load generator and failover verifier (`run`,
 `status`, `settle`, `verify`); `tools/clusterbench.ts` measures throughput
 (flags in its header).
-Design, proofs and numbers: `spec/REPLICATION.md` §13; TypeScript specifics
+Design, proofs and numbers: `spec/REPLICATION.md` §13.14; TypeScript specifics
 in `docs/DESIGN.md`.
 
 ## Limits
