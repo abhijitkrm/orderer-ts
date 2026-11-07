@@ -17,6 +17,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { ClientServer, DedupSm, PipelineSm, RecorderSm, Replica, StateMachine, defaultConfig, parseMembers } from "../src/cluster";
+import { deepDigestOf } from "../src/cluster/statemachine";
 import { Entry } from "../src/consensus";
 
 function die(msg: string): never {
@@ -43,6 +44,8 @@ class Audited implements StateMachine {
   snapshot(i: number) { return this.inner.snapshot(i); }
   restore(i: number, d: Uint8Array) { return this.inner.restore(i, d); }
   digest(i: number) { return this.inner.digest(i); }
+  // Forwarded, not defaulted: the default would answer the state-hash request with the cheap digest.
+  deepDigest(i: number) { return deepDigestOf(this.inner, i); }
 }
 
 async function main(): Promise<void> {
