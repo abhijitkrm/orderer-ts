@@ -103,3 +103,13 @@ write buffer passes 32 MB, as the other runtimes drop on a full queue; a
 snapshot streams in 1 MiB chunks with drain-based back-pressure while other
 frames to that peer wait behind it. CRC-32C is slicing-by-8 in JS: Node's
 `zlib.crc32` is the other polynomial.
+
+## Divergence detection: the event chain
+
+`PipelineSm.digest` is not a hash of the books: it is SHA-256 over the commands applied and one
+rolling hash per partition over the events that partition emitted (`spec/REPLICATION.md` 13.16),
+kept by an egress plug on the pipeline owner's thread. Reading it needs one `drain()` and no
+snapshot (6.3 ms against 229 ms for 300k resting orders). The chain is a u64 held as two u32 halves
+because BigInt would allocate on every one of the ~12 steps per event; per event the plug also
+decodes the event (`m.ev`). It cannot see a resting order's price until it trades, so
+`deepDigest` (the old full-state hash) backs `orderload settle` and the client protocol's hash.

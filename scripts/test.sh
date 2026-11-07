@@ -3,6 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CHECKED=1 scripts/build-harness.sh
-for t in ring golden pipeline replication cluster_wire cluster_shard cluster; do node dist/tests/$t.js; done
+for t in ring golden pipeline replication event_digest cluster_wire cluster_shard cluster; do node dist/tests/$t.js; done
 node dist/examples/quickstart.js > /dev/null
 spec/conformance.sh harness/bin vectors

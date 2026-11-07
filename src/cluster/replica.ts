@@ -14,7 +14,7 @@
 
 import * as path from "path";
 import { Config, Disk, Entry, NONE, Node, NodeId, Persist, Role } from "../consensus";
-import { Digest, sha256, StateMachine } from "./statemachine";
+import { Digest, deepDigestOf, sha256, StateMachine } from "./statemachine";
 import { Filter, Inbound, Member, Transport } from "./transport";
 import { SnapStore } from "./snapstore";
 import { Wal, WalError } from "./wal";
@@ -416,7 +416,7 @@ export class Replica {
           if (err !== undefined) { this.halt(`restoring snapshot: ${err}`); return; }
           this.smApplied = j.index;
         } else {
-          const d = this.sm.digest(this.smApplied);
+          const d = deepDigestOf(this.sm, this.smApplied);
           j.resolve(d ? { index: this.smApplied, digest: d } : undefined);
         }
         this.applyQ[this.applyHead++] = undefined as never;

@@ -28,7 +28,14 @@ export interface StateMachine {
   restore(index: number, data: Uint8Array): string | undefined;
   /// A digest of the state, for divergence detection; undefined = unsupported.
   digest(index: number): Digest | undefined;
+  /// A digest of the whole state, however expensive, for on-demand checks (the client protocol's
+  /// state hash). Absent means the same as `digest`.
+  deepDigest?(index: number): Digest | undefined;
 }
+
+/// `sm`'s deep digest, or its digest when it has no separate deep one.
+export const deepDigestOf = (sm: StateMachine, index: number): Digest | undefined =>
+  sm.deepDigest ? sm.deepDigest(index) : sm.digest(index);
 
 /// Records every non-empty entry. Snapshot = the list `index u64 | len u32 |
 /// data`; digest = SHA-256 of that list. Identical to orderer-rust's RecorderSm.
@@ -107,6 +114,11 @@ export class DedupSm implements StateMachine {
 
   digest(index: number): Digest | undefined {
     const inner = this.inner.digest(index);
+    return inner === undefined ? undefined : sha256(this.table(), inner);
+  }
+
+  deepDigest(index: number): Digest | undefined {
+    const inner = deepDigestOf(this.inner, index);
     return inner === undefined ? undefined : sha256(this.table(), inner);
   }
 }
